@@ -623,6 +623,32 @@ def audio_encoder_args(plan, opts):
     return args
 
 
+# ── TV Show tagging ───────────────────────────────────────────────────────────
+# Apple software decides what a file *is* from one integer: the `stik` atom at
+# moov/udta/meta/ilst. 9 = Movie, 10 = TV Show, absent = Home Video. There is no
+# positive "Home Video" code — it is the fallback, which is what this tool
+# produces by default. ffmpeg's mp4 muxer writes all four atoms we need natively
+# (`media_type` -> stik, `show` -> tvsh, `season_number` -> tvsn,
+# `episode_sort` -> tves) in the SAME pass, so faststart survives and no second
+# binary joins the dependency list.
+#
+# Deliberately NOT written: tvnn (network) and tven (free-text episode id) are
+# display-only, and every extra atom is one more thing an iOS 9.3.5 parser has
+# to accept for no functional gain.
+#
+# The value table is community-reverse-engineered from libmp4v2/AtomicParsley —
+# Apple has never published it — but every tool has agreed on it for 15+ years.
+def tv_show_metadata(opts):
+    """ffmpeg args that make Apple software file this as a TV show episode."""
+    show = opts.get("tv_show")
+    if not show:
+        return []                       # absent flag = today's behaviour exactly
+    return ["-metadata", "media_type=10",
+            "-metadata", "show=" + show,
+            "-metadata", "season_number=%d" % opts["season"],
+            "-metadata", "episode_sort=%d" % opts["episode"]]
+
+
 def build_ffmpeg_cmd(src, dst, plan, prof, opts):
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
            "-i", src]
@@ -660,6 +686,7 @@ def build_ffmpeg_cmd(src, dst, plan, prof, opts):
         # An untagged subtitle track may never appear in the stock player's
         # subtitle menu, which on this device is the only player there is.
         cmd += ["-metadata:s:s:0", "language=" + iso639_2(opts["subs_lang"])]
+    cmd += tv_show_metadata(opts)
     # Force the mp4 muxer even when the output is named .m4v. ffmpeg maps that
     # extension to its `ipod` muxer, which is precisely the muxer ipod-drop
     # found writes tags iOS 9.3.5 rejects. The .m4v name exists only to keep
@@ -1143,6 +1170,14 @@ def parse_args(argv):
                          "(only decodable on --device touch7)")
     ap.add_argument("-o", "--out", default=DEFAULT_OUT,
                     help=f"output folder (default: {tilde(DEFAULT_OUT)})")
+    ap.add_argument("--tv-show", metavar="SERIES",
+                    help="file this as a TV show episode of SERIES instead of a "
+                         "home video. Changes which Finder pane it syncs from")
+    ap.add_argument("--season", type=int, default=1, metavar="N",
+                    help="season number for --tv-show (default: 1)")
+    ap.add_argument("--episode", type=int, default=1, metavar="N",
+                    help="episode number for --tv-show (default: 1) - this is "
+                         "what orders episodes within the season")
     ap.add_argument("--ext", choices=["m4v", "mp4"], default="m4v",
                     help="output container extension (default: m4v, which the "
                          "Apple TV app imports most reliably)")
@@ -1206,6 +1241,9 @@ def main(argv=None):
         "device": device,
         "out": os.path.expanduser(args.out),
         "ext": args.ext,
+        "tv_show": args.tv_show,
+        "season": args.season,
+        "episode": args.episode,
         "fast": args.fast,
         "force_encode": args.force_encode,
         "burn_subs": args.burn_subs,
@@ -1245,9 +1283,24 @@ def main(argv=None):
 
     print(f"\n{'=' * 60}")
     print(f"{ok}/{len(inputs)} item(s) ready in {tilde(opts['out'])}")
-    print("Sync: drag into the Apple TV app on the Mac (it lands under Home "
-          "Videos),\n      then plug the iPod in -> Finder -> the device -> "
-          "Movies -> tick it -> Sync.")
+    if opts["tv_show"]:
+        # Tagging as a TV show moves the file to a DIFFERENT Finder pane. Saying
+        # so here prevents the failure that otherwise reads as a broken sync:
+        # the user looks under Movies, finds nothing, and assumes the encode
+        # failed. The auto-include warning matters for the same reason - a
+        # capped "N newest unwatched" rule drops episodes silently.
+        print(f"Sync: tagged as a TV show ({opts['tv_show']} "
+              f"S{opts['season']:02d}E{opts['episode']:02d}).")
+        print("      Drag into the Apple TV app -> it lands under TV Shows, "
+              "NOT Home Videos.")
+        print("      Then Finder -> the device -> TV Shows (not Movies) -> tick "
+              "it -> Sync.")
+        print("      Turn OFF \"Automatically include\" first, or a capped rule "
+              "can drop episodes silently.")
+    else:
+        print("Sync: drag into the Apple TV app on the Mac (it lands under Home "
+              "Videos),\n      then plug the iPod in -> Finder -> the device -> "
+              "Movies -> tick it -> Sync.")
     return 0 if ok else 1
 
 

@@ -212,6 +212,40 @@ Three choices exist purely to keep that path working:
 - **Source metadata is dropped and one clean `title` written.** Same reasoning: do not hand
   an iOS 9 parser arbitrary tags from a file it never asked for.
 
+### Movies or TV shows
+
+Apple software decides what a file *is* from one integer — the `stik` atom, buried at
+`moov → udta → meta → ilst`. **9 is a movie, 10 is a TV show, and absent is a home video.**
+There is no positive code for "home video"; it is the fallback bucket, which is exactly what
+this tool produces by default.
+
+`--tv-show` writes `stik=10` plus the three atoms that make episodes group and sort, in the
+same single ffmpeg pass — no second tool, and the faststart guarantee survives untouched:
+
+```bash
+python ipod_movie_maker.py ep03.mkv --tv-show "Series Name" --season 1 --episode 3
+```
+
+| Atom | Written from | Does |
+|---|---|---|
+| `stik` | `--tv-show` presence | The classification itself — `10` means TV show |
+| `tvsh` | `--tv-show` | Series name; episodes group by exact string match |
+| `tvsn` | `--season` | Groups episodes into a season |
+| `tves` | `--episode` | Orders episodes *within* the season |
+
+Season and episode are not cosmetic. Without them the file still lands under TV Shows but
+sorts by filename, which discards the only reason to tag it.
+
+**It changes which pane you sync from.** A TV-show-tagged file leaves the Movies list
+entirely: import puts it under *TV Shows*, and Finder syncs it from its own **TV Shows**
+pane. Turn **"Automatically include" off** there before syncing — a capped rule like
+*10 newest unwatched* can drop episodes with no error. The tool prints this reminder after
+any `--tv-show` run, because looking under Movies and finding nothing reads exactly like a
+failed encode.
+
+Worth it for a multi-episode series on a device whose stock player has no folders. Not worth
+it for a single film — leave those as home videos.
+
 **Subtitles, honestly.** They are muxed as `mov_text` (tx3g), Apple's own in-`.mp4`
 subtitle format, tagged with an ISO 639-2 language code so the player lists them. Whether
 the stock iOS 9 Videos app actually *renders* them is **unverified on a real device** —
@@ -234,6 +268,8 @@ pip install -r requirements.txt      # yt-dlp
 | `-p, --profile` | `sharp` / `standard` / `compact` / `tiny` |
 | `-c, --codec` | `h264` (default) or `hevc` (`touch7` only — refused on `touch5`) |
 | `-o, --out` | output folder (default `~/Movies/iPod`) |
+| `--tv-show SERIES` | File it as a TV show episode instead of a home video — changes the sync pane |
+| `--season N` / `--episode N` | Season and episode numbers for `--tv-show` (both default to `1`) |
 | `--ext` | `m4v` (default) or `mp4` — the name only; the muxer stays mp4 either way |
 | `--fast` | macOS hardware encoder — around ten times faster |
 | `--force-encode` | transcode even when the source already fits |

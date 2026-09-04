@@ -111,6 +111,28 @@ no persistent state.
   TV app's importer prefers it; the bytes must stay plain mp4. Check with
   `head -c 12 out.m4v | xxd` — `ftypisom` is right, `ftypM4V ` means the guard
   was lost. `--ext mp4` switches the name back without changing the muxer.
+- **TV-show classification is one integer: the `stik` atom** at
+  `moov/udta/meta/ilst`. `9` = Movie, `10` = TV Show, **absent = Home Video** —
+  there is no positive "home video" code, it is the fallback, which is what the
+  default output is. `tv_show_metadata()` writes `stik` plus `tvsh` (series),
+  `tvsn` (season) and `tves` (episode) via ffmpeg's own `media_type` / `show` /
+  `season_number` / `episode_sort` keys, **in the same pass**, so no second
+  binary and no second rewrite — faststart survives. Verified on the bytes:
+  `stik` came out `…7374696b…0a` and the box order stayed `ftyp moov free mdat`.
+  Deliberately NOT written: `tvnn` (network) and `tven` (episode id) are
+  display-only, and every extra atom is one more an iOS 9.3.5 parser must accept
+  for no functional gain. The `stik` value table is community-reverse-engineered
+  from libmp4v2/AtomicParsley — Apple never published it — but every tool has
+  agreed for 15+ years. **Season and episode are not cosmetic:** without them the
+  file lands under TV Shows but sorts by filename.
+- **Tagging a TV show changes which Finder pane syncs it.** It leaves the Movies
+  list entirely and gets its own TV Shows pane, whose "Automatically include"
+  rules (e.g. *10 newest unwatched*) can silently drop episodes. `main()` prints
+  that warning after any `--tv-show` run — looking under Movies and finding
+  nothing reads exactly like a failed encode, so the reminder is load-bearing.
+  **Unverified:** whether iOS 9.3.5 accepts these atoms, and whether re-tagging a
+  file already imported reclassifies it. Only the device settles the first;
+  assume remove-and-re-add for the second.
 - **`-map_metadata -1`, then one clean `-metadata title=`.** Same lesson: don't
   copy arbitrary source tags into a file iOS 9.3.5 has to parse. A file the TV
   app imports but the iPod refuses looks like success on the Mac, which is the
