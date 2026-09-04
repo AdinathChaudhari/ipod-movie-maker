@@ -1,8 +1,10 @@
 <!--
 GitHub metadata — authored here, applied by hand in repo Settings (NOT rendered on the page):
 About:  Download, remux, transcode & verify video for an iPod touch (5th gen) — a single-file yt-dlp + FFmpeg CLI that picks the cheapest of three plans and ffprobes what it wrote.
-Topics (ranked): video-converter, ffmpeg, yt-dlp, ipod, h264, video-transcoding, ipod-touch, ios, python, cli, macos, ffprobe, hardware-decoding, media-conversion, apple-a5, subtitles, ipod-reel
-Social preview: docs/media/hero.png at 1280x640 once the asset exists.
+Topics (ranked): video-converter, ffmpeg, yt-dlp, ipod, h264, video-transcoding, ipod-touch, ios, python, cli, macos, ffprobe, hardware-decoding, media-conversion, apple-a5, subtitles, m4v
+Social preview: docs/media/hero-glass.jpg (1280x640) — derived from docs/media/hero.png by
+        `python Tools/image_compress.py docs/media/hero.png 1MB --glass`, uploaded by hand
+        in Settings > General > Social preview. The card is git-ignored; hero.png is the source.
 -->
 
 # ipod-movie-maker — Video for an iPod touch
@@ -15,8 +17,9 @@ Social preview: docs/media/hero.png at 1280x640 once the asset exists.
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey)
 ![Requires: FFmpeg](https://img.shields.io/badge/requires-FFmpeg-007808)
 
-<!-- ![hero](docs/media/hero.png) — width-capped <img> once the asset exists.
-     Keep COMMENTED OUT until docs/media/hero.png is rendered — never ship a broken image. -->
+<p align="center">
+  <img src="docs/media/hero.png" alt="ipod-movie-maker — a film ribbon narrowing into a small glowing pocket screen" width="820">
+</p>
 
 A converter that aims at exactly one thing: a 1136 × 640 panel driven by an Apple A5,
 frozen at iOS 9.3.5. Everything that device can decode in hardware — codec, profile,
@@ -28,11 +31,11 @@ Fusion) is one more entry in that table, reachable with `--device touch7`.
 
 | What you give it | Plan it picks | What actually happens |
 |---|---|---|
-| **A video link** | [`copy`](#how-it-decides) | The format selector already asked for H.264 + AAC at the target height — lossless remux, no re-encode, seconds |
-| **An H.264 file with AC3, DTS or Opus sound** | [`audio`](#how-it-decides) | Picture stream copied untouched, sound re-encoded to 48 kHz stereo AAC |
-| **A 4K, HEVC, 10-bit or 60 fps file** | [`encode`](#how-it-decides) | Full transcode into the panel's envelope: H.264 Main level 3.1, 8-bit, 30 fps, ≤ 720p |
-| **A folder or a playlist link** | one per item | Each item planned on its own; a dead item lands in `failed.txt` and the batch keeps going |
-| **A file you already have, with `--check`** | none | [`ipod_movie_maker.py`](ipod_movie_maker.py) ffprobes it against the device envelope and exits non-zero if it will not play |
+| **A video link** | [`copy`](ipod_movie_maker.py) | The format selector already asked for H.264 + AAC at the target height — lossless remux, no re-encode, seconds |
+| **An H.264 file with AC3, DTS or Opus sound** | [`audio`](ipod_movie_maker.py) | Picture stream copied untouched, sound re-encoded to 48 kHz stereo AAC |
+| **A 4K, HEVC, 10-bit or 60 fps file** | [`encode`](ipod_movie_maker.py) | Full transcode into the panel's envelope: H.264 Main level 3.1, 8-bit, 30 fps, ≤ 720p |
+| **A folder or a playlist link** | [one per item](ipod_movie_maker.py) | Each item planned on its own; a dead item lands in `failed.txt` and the batch keeps going |
+| **A file you already have** | [`--check`](ipod_movie_maker.py) | ffprobes it against the device envelope and exits non-zero if it will not play |
 
 ## Quick start
 
@@ -116,13 +119,12 @@ sample-clip.mkv   134 MB
     ✗ container       .mkv
     ✗ video codec     hevc
     ✗ pixel format    yuv420p10le
-    ! resolution      1920x1080 - larger than the panel can show
     ✗ frame rate      60 fps
     ✓ dynamic range   SDR
     ✗ audio codec     ac3
     ✗ audio channels  6
     ✓ sample rate     44100 Hz
-    ! faststart       moov at end
+    ...
 
   ✗ Will not play (or not in hardware) - run it through ipod-movie-maker.
 

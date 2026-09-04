@@ -13,3 +13,12 @@ venv/
 *.srt
 *.vtt
 failed.txt
+
+# hero.png is the committed source of truth. The social card is DERIVED from it
+# (Tools/image_compress.py --glass) and uploaded by hand to Settings > Social
+# preview — committing it would only create a second thing to keep in sync.
+docs/media/hero-glass.jpg
+
+# The stored image prompt + essence snapshot. Private by house convention:
+# only the rendered hero.png ships.
+docs/media/ABOUT-IMAGE.md
