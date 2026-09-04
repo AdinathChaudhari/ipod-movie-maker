@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+.DS_Store
+
+# Output and test media — never commit video
+*.mp4
+*.m4v
+*.mkv
+*.webm
+*.mov
+*.srt
+*.vtt
+failed.txt

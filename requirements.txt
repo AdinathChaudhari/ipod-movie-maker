@@ -1,0 +1,12 @@
+yt-dlp>=2026.3.17
+#
+# Not a pip package, but REQUIRED (install via your OS package manager, e.g.
+# `brew install ffmpeg`): ffmpeg and ffprobe do all the muxing, encoding and
+# verification. The tool refuses to start without them.
+#
+# Optional but worth having in your ffmpeg build:
+#   libass  -> the `subtitles` filter, needed for --burn-subs. Without it the
+#              tool falls back to soft mov_text subs, which iOS renders anyway.
+#   libzimg -> the `zscale` filter, needed to tone-map HDR sources to SDR.
+#              Without it an HDR source converts washed-out and grey.
+# Check with:  ffmpeg -filters | grep -E ' (subtitles|zscale) '
