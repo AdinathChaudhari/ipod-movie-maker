@@ -358,7 +358,7 @@ def is_ffmpeg_noise(line):
     return any(pat in low for pat in FFMPEG_NOISE)
 
 
-def run_ffmpeg(cmd, verbose=False):
+def run_ffmpeg(cmd, verbose=False, trust_final_stats=True):
     """Run ffmpeg, echoing progress and real warnings but dropping the chatter.
 
     Returns (returncode, lines_hidden). ffmpeg terminates its -stats progress
@@ -366,6 +366,19 @@ def run_ffmpeg(cmd, verbose=False):
     by line alone never flushes the counter and a long encode looks frozen.
     Hidden lines are counted, never silently dropped - convert() prints the
     tally, and --verbose bypasses this whole path for a raw passthrough.
+
+    trust_final_stats=False wipes whatever progress line is left on screen at
+    the end instead of leaving it there. With an attached-pic stream mapped,
+    ffmpeg's closing line computes time, bitrate and speed against the
+    poster's own ~0.04s timeline rather than the video's, which reads as a
+    73 Gbit/s encode at 0.02x speed. Mid-encode lines are unaffected, and the
+    tool prints the real output size on the next line anyway.
+
+    Note this clears the leftover line rather than trying to recognise it:
+    ffmpeg marks the final line by prefixing L to one field, but WHICH field
+    moves - "Lsize=" normally, "Lq=" when a second video stream pushes a second
+    q into that slot. Matching on the marker missed exactly the case this
+    exists for.
     """
     if verbose:
         return subprocess.call(cmd), 0
@@ -374,6 +387,7 @@ def run_ffmpeg(cmd, verbose=False):
                             stderr=subprocess.PIPE, text=True,
                             errors="replace")
     hidden = 0
+    nonlocal_progress = [False]         # list so emit() can set it
 
     def emit(line):
         nonlocal hidden
@@ -383,6 +397,7 @@ def run_ffmpeg(cmd, verbose=False):
         if is_ffmpeg_noise(line):
             hidden += 1
         elif line.startswith(("frame=", "size=", "video:")):
+            nonlocal_progress[0] = True
             # Overwrite in place, and clear to end of line so a shrinking
             # progress line leaves no tail of the previous one behind.
             sys.stdout.write("\r  " + line + CLEAR_EOL)
@@ -402,6 +417,9 @@ def run_ffmpeg(cmd, verbose=False):
         else:
             buf += ch
     emit(buf)
+    if nonlocal_progress[0] and not trust_final_stats:
+        sys.stdout.write("\r" + CLEAR_EOL)
+        sys.stdout.flush()
     proc.stderr.close()
     return proc.wait(), hidden
 
@@ -1365,7 +1383,8 @@ def convert(src, out_dir, title, prof, opts, workdir):
         print("\n  " + " ".join(cmd))
         return None
     print()
-    rc, hidden = run_ffmpeg(cmd, opts["verbose"])
+    rc, hidden = run_ffmpeg(cmd, opts["verbose"],
+                            trust_final_stats=not opts.get("cover"))
     if (rc != 0 or not os.path.exists(dst)) and opts.get("cover"):
         # The poster is decoration; the video is the point. An image ffprobe
         # accepted but the encoder then choked on must not cost the whole
@@ -1384,7 +1403,8 @@ def convert(src, out_dir, title, prof, opts, workdir):
             plan["mode"] = "encode"
             plan["video_why"].append("remux failed on this source")
             cmd = build_ffmpeg_cmd(src, dst, plan, prof, opts)
-            rc, again = run_ffmpeg(cmd, opts["verbose"])
+            rc, again = run_ffmpeg(cmd, opts["verbose"],
+                                   trust_final_stats=not opts.get("cover"))
             hidden += again
         if rc != 0 or not os.path.exists(dst):
             print(f"  {CROSS} ffmpeg failed (exit {rc}).")
@@ -1465,7 +1485,8 @@ def retag(path, prof, opts):
         return None
 
     print()
-    rc, hidden = run_ffmpeg(cmd, opts["verbose"])
+    rc, hidden = run_ffmpeg(cmd, opts["verbose"],
+                            trust_final_stats=not (cover or has_poster))
     if rc != 0 or not os.path.exists(dst):
         print(f"  {CROSS} Re-tag failed (exit {rc}).")
         if os.path.exists(dst):
