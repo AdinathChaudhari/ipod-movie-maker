@@ -43,6 +43,12 @@ only way that works — git history keeps whatever was pushed once.
     metadata blocks. All three are appended in the same pass as the encode.
   - `item_opts()` — per-item copy of `opts`. **Every per-episode value goes
     through here**; see the shared-`opts` gotcha below.
+  - `plan_show()` — the single entry point all four drivers use to decide a
+    show and an episode number. If you add a fifth driver, call this.
+  - `load_registry()` / `save_registry()` / `reserve_episode()` /
+    `show_key()` / `tidy_name()` / `detect_show()` /
+    `registry_episodes_on_disk()` — the registry. `ShowFull` is its only
+    exception.
   - `retag()` — `--retag`, a lossless `-c copy` tag rewrite. Verified
     byte-identical: video and audio MD5 match the source exactly.
   - `fmt_spec()` — the yt-dlp format selector (the point of the whole tool).
@@ -62,8 +68,13 @@ python ipod_movie_maker.py --check movie.mp4     # verify only, exits 1 if it wo
 python ipod_movie_maker.py --device touch7 …     # target the A10 instead of the A5
 ```
 
-Default output is `~/Movies/iPod`. Default `--device` is `touch5`. No config,
-no persistent state.
+Default output is `~/Movies/iPod`. Default `--device` is `touch5`. No config
+file. **One piece of persistent state, added deliberately:** the show registry
+at `~/Library/Application Support/ipod-movie-maker/shows.json`. It exists
+because "the next episode" cannot mean anything inside a single run — see the
+registry gotchas below for why that outweighs the statelessness it costs.
+`IPOD_MOVIE_MAKER_REGISTRY` overrides the path, which is how you exercise any
+of this without touching the real file.
 
 ## Conventions & gotchas
 
@@ -199,6 +210,59 @@ no persistent state.
   file still passes every check. `retag()` adds `-map 0:v:1?` when the source
   has an attached pic and no new `--cover` replaces it. Losslessness is
   verified, not assumed: video and audio MD5s match the source byte for byte.
+- **The registry is global, never per-`--out`.** The collision it prevents
+  happens inside the Mac's single Apple TV library, whichever folder the file
+  was written to. A per-output-folder registry would let two `-o` runs both
+  claim `S01E01` for one show and reopen the bug one level up.
+- **`ShowFull`, not `SystemExit`, inside a batch.** `check_episode_range()`
+  raises `SystemExit`, which is a `BaseException` and therefore sails straight
+  through every `except Exception` guard in this file — calling it per item
+  would abort the whole batch and break the one-dead-item rule. It stays where
+  it is (pre-flight, before any item converts, and only when `--episode` was
+  given explicitly). Inside the per-item path, `reserve_episode()` raises
+  `ShowFull` instead, which the drivers catch and turn into a skipped item.
+- **`--episode` defaults to `None`, not `1`.** That is the only way to tell
+  "the user typed 1" from "the user said nothing, ask the registry". Every
+  reader of `args.episode` therefore goes through `episode_or_one` /
+  `explicit_episode`, resolved once at the top of `main()`. **Grep
+  `args.episode` by hand after touching this** — a missed reader is a
+  `TypeError` on the exact case the feature exists for (`--tv-show X` with no
+  number), which nothing else exercises.
+- **`plan_show()`'s `fallback` and `src_path` are different things, and
+  conflating them is a collision generator.** `fallback` is a show NAME of last
+  resort; `src_path` identifies THIS item for dedupe. One parameter doing both
+  jobs hands every file in a folder the same source key, so the whole folder
+  gets one episode number — caught in testing, not in review.
+- **The registry's stored `name` is first-writer-wins.** Apple groups episodes
+  by the literal `tvsh` string, so a later `--tv-show "series a"` must not
+  overwrite an earlier `"Series A"` — that splits one show in two on the device
+  while the registry still thinks they match. `reserve_episode()` returns the
+  canonical name and `plan_show()` writes THAT into the atom, not what was
+  typed. `show_key()` (casefold + whitespace-collapse) is what matches;
+  `tidy_name()` is what gets stored. Blank/whitespace-only `--tv-show` is
+  refused outright — `" "` is truthy and normalizes to an empty key that every
+  other blank-named run would also land in.
+- **Numbers advance on ATTEMPT and are saved per item.** Both halves matter.
+  Advancing on success would need in-flight reservation state to stay
+  collision-free; advancing on attempt just leaves a gap, and gaps are
+  cosmetic where collisions are silent data loss. Saving per item rather than
+  per batch is what makes Ctrl-C safe — this tool documents Ctrl-C as "skip
+  this item", and a deferred save would throw away numbers already handed out
+  so the next run reissues them.
+- **`--dry-run` must never consume a number.** `reserve_episode(commit=False)`
+  computes the same answer and writes nothing. Any new caller of
+  `reserve_episode()` has to pass this through.
+- **The files are the truth; the registry is an index.** It can be wrong — a
+  run with an explicit `--episode`, output deleted, a conversion on another
+  machine. `--rebuild-registry SERIES` reads the `tves` atoms back off the
+  `.m4v` files in `--out` and resets the counter to match. That reconciliation
+  is deliberately NOT on the hot path: ffprobing every file on every run does
+  not pay for itself, and a version that silently took `max(disk, cache)` while
+  claiming "disk wins" was one of the bugs review caught.
+- **Concurrency is undefended, on purpose.** Two terminals converting the same
+  show at the same moment is last-writer-wins on a millisecond window. That is
+  an acceptable gap for a single-user CLI — but it is a gap, not a solved
+  problem, so don't write docs that claim otherwise.
 - **`-map_metadata -1`, then one clean `-metadata title=`.** Same lesson: don't
   copy arbitrary source tags into a file iOS 9.3.5 has to parse. A file the TV
   app imports but the iPod refuses looks like success on the Mac, which is the

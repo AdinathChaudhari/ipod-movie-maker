@@ -274,6 +274,9 @@ pip install -r requirements.txt      # yt-dlp
 | `--date YYYY-MM-DD` | Release date — the `©day` atom |
 | `--cover IMAGE` | Poster image — the `covr` atom, which is what fills the grey show tile |
 | `--no-auto-meta` | Don't auto-fill blurb, date and poster from the download's own metadata |
+| `--series` | Work out the show from the download itself; continue it if known, start a new one if not |
+| `--shows` | List what the show registry remembers, then exit |
+| `--rebuild-registry SERIES` | Re-read episode numbers from the files in `--out` and reset the registry to match |
 | `--retag FILE` | Rewrite one file's tags losslessly, no re-encode (repeatable) |
 | `--ext` | `m4v` (default) or `mp4` — the name only; the muxer stays mp4 either way |
 | `--fast` | macOS hardware encoder — around ten times faster |
@@ -311,6 +314,51 @@ ceiling is **255**: ffmpeg builds those atoms from a single byte, so `300`
 becomes `44` and a date like `20260909` becomes `45` with no warning at all.
 The tool refuses anything out of range up front, including a folder whose count
 would run past the end.
+
+### Remembering where a show got to
+
+Episode numbers only mean something across runs, so the tool keeps one small
+file:
+
+```
+~/Library/Application Support/ipod-movie-maker/shows.json
+```
+
+Omit `--episode` and it hands out the next unused number for that show. Add an
+episode next week and it continues; point it at something it has never seen and
+that starts a new show at episode 1:
+
+```
+$ python ipod_movie_maker.py --tv-show "Series A" <url>
+  episode  Series A S01E04
+
+$ python ipod_movie_maker.py --tv-show "Series B" <url>
+  episode  Series B S01E01  (new show)
+```
+
+`--series` goes one step further and works the show out from the download's own
+metadata — its `series`, else channel, else uploader; for a local file, the
+folder it sits in. So a whole podcast needs no name typed at all:
+
+```
+$ python ipod_movie_maker.py --series <podcast-episode-url>
+```
+
+Converting the same source twice reuses its original number rather than burning
+a new one, and says so. `--shows` prints what the registry holds.
+
+Four things worth knowing:
+
+1. **Nothing changes if you don't ask for it.** Without `--tv-show` or
+   `--series` the output is a home video, exactly as before, and the registry is
+   never touched.
+2. **An explicit `--episode` still wins** and does not move the registry's
+   counter — it stays a one-off.
+3. **The files are the truth.** If the registry is lost, or you converted some
+   episodes elsewhere, `--rebuild-registry "Series A"` reads the numbers back
+   out of the files in `--out` and resets the counter to match.
+4. **A season holds 255 episodes.** At the wall the tool stops that item and
+   tells you to pass `--season 2`; the rest of the batch carries on.
 
 ### Fixing a file you already made
 

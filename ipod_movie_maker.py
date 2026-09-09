@@ -973,6 +973,234 @@ MODE_BLURB = {
 }
 
 
+# ── Show registry ─────────────────────────────────────────────────────────────
+# The one piece of persistent state this tool keeps, and it exists for exactly
+# one reason: "the next episode" has no meaning inside a single run. Apple keys
+# an episode by (show, season, episode) and silently REPLACES on a duplicate
+# triple, so a tool that cannot remember what it already numbered will collide
+# the moment you add episode two next week.
+#
+# Global, not per --out: the collision happens inside the Mac's single Apple TV
+# library, whichever folder the file was written to. A per-output-folder
+# registry would let two -o runs both claim S01E01 and reopen the bug one level
+# up. Path follows the macOS convention this repo family already uses.
+# IPOD_MOVIE_MAKER_REGISTRY overrides the location. That exists so this can be
+# exercised against a throwaway file instead of the user's real one - a test
+# that mutates the registry it is meant to protect is worse than no test.
+REGISTRY_PATH = os.environ.get("IPOD_MOVIE_MAKER_REGISTRY") or os.path.expanduser(
+    "~/Library/Application Support/ipod-movie-maker/shows.json")
+REGISTRY_VERSION = 1
+
+
+class ShowFull(Exception):
+    """A season has used all 255 episode numbers.
+
+    A plain Exception, deliberately: check_episode_range() raises SystemExit,
+    which is a BaseException and therefore sails straight through every
+    `except Exception` per-item guard in this file. Raising SystemExit from
+    inside a batch loop would abort the whole batch, breaking the house rule
+    that one dead item never does that. This is the per-item equivalent.
+    """
+
+
+def tidy_name(name):
+    """The display form of a show name: trimmed, inner whitespace collapsed.
+
+    Stored as well as matched on. Storing the raw string means one sloppy
+    first run (`--tv-show "  Series A "`) bakes stray spaces into the tvsh
+    atom of every future episode of that show.
+    """
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def show_key(name):
+    """The match key: case-folded on top of tidy_name().
+
+    Collapses "Series A", "series a" and "Series  A" onto one show, because
+    those are the same show typed on three different evenings. Deliberately
+    does NOT collapse punctuation or drop words - "Series A" and "Series A
+    Podcast" are allowed to be different shows, since guessing wrong there
+    silently merges two libraries.
+    """
+    return tidy_name(name).casefold()
+
+
+def _registry_shape_ok(data):
+    return (isinstance(data, dict) and isinstance(data.get("shows"), dict)
+            and int(data.get("version") or 0) <= REGISTRY_VERSION)
+
+
+def load_registry(path=None):
+    """Read the registry. Never raises, never aborts a conversion.
+
+    A missing file is the normal first-run case and says nothing. A corrupt
+    one, or one written by a newer version of this tool, is moved aside rather
+    than overwritten - it is the only record of what has already been numbered,
+    so destroying it is worse than any parse error - and the run continues on
+    an empty registry, loudly.
+    """
+    path = path or REGISTRY_PATH
+    if not os.path.exists(path):
+        return {"version": REGISTRY_VERSION, "shows": {}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not _registry_shape_ok(data):
+            raise ValueError("unexpected shape or a newer schema version")
+    except Exception as err:
+        keep = f"{path}.broken"
+        n = 1
+        while os.path.exists(keep):        # never clobber an older backup
+            n += 1
+            keep = f"{path}.broken-{n}"
+        try:
+            os.replace(path, keep)
+            where = f" Moved to {tilde(keep)}."
+        except OSError:
+            where = ""
+        print(f"  {WARN} Show registry unreadable ({err}).{where} "
+              "Starting a fresh one - check episode numbers before syncing.")
+        return {"version": REGISTRY_VERSION, "shows": {}}
+    data["version"] = REGISTRY_VERSION
+    return data
+
+
+def save_registry(data, path=None):
+    """Write the registry atomically. Returns True on success.
+
+    The temp file has to live in the SAME directory as the target: os.replace()
+    is only atomic within one filesystem, and the system temp dir is not
+    guaranteed to share one with Application Support. A failure here is
+    reported and swallowed - losing the bookkeeping is bad, losing the
+    conversion it was bookkeeping for is worse.
+    """
+    path = path or REGISTRY_PATH
+    folder = os.path.dirname(path)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=".shows-", suffix=".json")
+        try:
+            with open(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False,
+                          sort_keys=True)
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            raise
+        return True
+    except Exception as err:
+        print(f"  {WARN} Could not save the show registry ({err}); this "
+              "episode's number will not be remembered.")
+        return False
+
+
+def source_key(info=None, path=None):
+    """A stable identity for one episode, so re-converting it reuses its slot.
+
+    yt-dlp's own `id` over the URL or the title: a URL collects tracking
+    parameters and a title gets edited, either of which would make a repeat
+    conversion look like a brand new episode and burn a number.
+    """
+    ident = (info or {}).get("id")
+    if ident:
+        extractor = ((info or {}).get("extractor_key") or "x").lower()
+        return f"{extractor}:{ident}"
+    return os.path.abspath(path) if path else None
+
+
+def reserve_episode(show, season, src=None, path=None, commit=True):
+    """Hand out this item's episode number and persist it BEFORE converting.
+
+    Returns (canonical_name, season, episode, is_new_show, reused).
+
+    The canonical name is whatever the show was FIRST called, not what this
+    run typed. Apple groups episodes by the literal tvsh string, so letting a
+    later "series a" overwrite an earlier "Series A" would split one show into
+    two on the device while the registry still thought they matched.
+
+    Load-modify-save runs per item rather than once per batch, on purpose.
+    Deferring the save means a Ctrl-C - which this tool documents as "skip
+    this item" - throws away numbers already handed out, and the next run
+    reissues them. That is the collision bug, reintroduced by a keystroke.
+
+    commit=False computes the same answer and writes nothing, which is what
+    --dry-run needs: printing a command must never consume an episode number.
+
+    Numbers advance on ATTEMPT, not on success, matching how the folder driver
+    has always numbered by position: a failed item leaves a gap rather than
+    shuffling every later episode down one. Gaps are cosmetic; collisions are
+    silent data loss on the device.
+    """
+    reg = load_registry(path)
+    key = show_key(show)
+    entry = reg["shows"].setdefault(key, {})
+    name = entry.setdefault("name", tidy_name(show)) or tidy_name(show)
+    seasons = entry.setdefault("seasons", {})
+    sources = entry.setdefault("sources", {})
+    is_new = not seasons
+
+    if src and src in sources:
+        seen = sources[src]
+        return name, int(seen["season"]), int(seen["episode"]), False, True
+
+    slot = str(int(season))
+    episode = int(seasons.get(slot, 1))
+    if episode > TVES_MAX:
+        raise ShowFull(
+            f"{tidy_name(show)} season {season} has used all {TVES_MAX} "
+            "episode numbers (the tves atom is one byte). Pass --season "
+            f"{int(season) + 1} to carry on in a new season.")
+    seasons[slot] = episode + 1
+    if src:
+        sources[src] = {"season": int(season), "episode": episode}
+    if commit:
+        save_registry(reg, path)
+    return name, int(season), episode, is_new, False
+
+
+def detect_show(info):
+    """Work out which show a downloaded item belongs to, or None.
+
+    `series` is the only field that genuinely means "this is episodic", and
+    almost nothing populates it; `channel` and `uploader` are set on nearly
+    every ordinary upload and are what actually makes this useful for a
+    podcast. playlist_title last: it describes the list you happened to grab,
+    not the show, so it is a guess of last resort.
+    """
+    for field in ("series", "channel", "uploader", "playlist_title"):
+        name = tidy_name((info or {}).get(field) or "")
+        if name:
+            return name
+    return None
+
+
+def registry_episodes_on_disk(out_dir, show):
+    """Every (season, episode) already written for `show` under out_dir.
+
+    The registry is an index, not the truth - the files are. This is what
+    --rebuild-registry uses to recover after the JSON is lost, after a run
+    with an explicit --episode, or after converting on another machine.
+    """
+    want = show_key(show)
+    found = {}
+    for name in sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []:
+        full = os.path.join(out_dir, name)
+        if os.path.splitext(name)[1].lower() not in (".m4v", ".mp4", ".mov"):
+            continue
+        tags = ((probe_media(full) or {}).get("format") or {}).get("tags") or {}
+        if show_key(tags.get("show") or "") != want:
+            continue
+        try:
+            season = int(tags.get("season_number") or 1)
+            episode = int(tags.get("episode_sort") or 0)
+        except (TypeError, ValueError):
+            continue
+        if episode:
+            found.setdefault(season, set()).add(episode)
+    return found
+
+
 def item_opts(opts, info=None, episode=None):
     """A per-item copy of opts, auto-filled from yt-dlp's info dict.
 
@@ -998,6 +1226,53 @@ def item_opts(opts, info=None, episode=None):
         out["date"] = f"{day[:4]}-{day[4:6]}-{day[6:]}"
     if not out.get("cover") and info.get("_thumbnail_path"):
         out["cover"] = info["_thumbnail_path"]
+    return out
+
+
+def plan_show(opts, info=None, offset=0, fallback=None, src_path=None):
+    """Per-item opts with the show and episode decided. Never raises.
+
+    `fallback` is a show NAME of last resort; `src_path` identifies THIS item
+    for dedupe. They are separate parameters because conflating them is a
+    collision generator: every file in one folder shares the folder name, so a
+    single argument doing both jobs hands the whole folder one episode number.
+
+    The three ways an item gets a show, in precedence order:
+      1. --tv-show "Name" - always wins, exactly as before.
+      2. --series - work it out from the download's own metadata, or from the
+         containing folder for a local file.
+      3. neither - a home video, and the registry is not touched at all. This
+         is the default, so nothing changes for anyone who did not ask for it.
+    And the number: an explicit --episode keeps today's behaviour (the number
+    typed, plus position in the batch); without one the registry hands out the
+    next for that show.
+    """
+    out = item_opts(opts, info)
+    if not out.get("tv_show") and out.get("auto_series"):
+        guessed = detect_show(info) or fallback
+        if not guessed:
+            print(f"  {WARN} --series could not tell which show this belongs "
+                  "to; filing it as a home video instead.")
+            return out
+        out["tv_show"] = guessed
+    if not out.get("tv_show"):
+        return out
+    out["tv_show"] = tidy_name(out["tv_show"])
+
+    if out.get("explicit_episode") is not None:
+        out["episode"] = out["explicit_episode"] + offset
+        return out
+    try:
+        name, season, episode, is_new, reused = reserve_episode(
+            out["tv_show"], out["season"], source_key(info, src_path),
+            commit=not out.get("dry_run"))
+    except ShowFull as full:
+        print(f"  {CROSS} {full}")
+        return None
+    # Take the registry's spelling, so every episode's tvsh atom matches.
+    out["tv_show"] = name
+    out["season"], out["episode"] = season, episode
+    out["_show_new"], out["_show_reused"] = is_new, reused
     return out
 
 
@@ -1040,8 +1315,17 @@ def convert(src, out_dir, title, prof, opts, workdir):
         print(f"  subs     {len(plan['embedded_text_subs']) + len(plan['sidecars'])}"
               " track(s) as mov_text (tagged for the Videos app)")
     if opts.get("tv_show"):
+        note = "  (new show)" if opts.get("_show_new") else ""
         print(f"  episode  {opts['tv_show']} "
-              f"S{opts['season']:02d}E{opts['episode']:02d}")
+              f"S{opts['season']:02d}E{opts['episode']:02d}{note}")
+        if opts.get("_show_reused"):
+            # Reusing the number is right - this IS that episode - but the
+            # earlier output is still on disk, and two files carrying one
+            # (show, season, episode) is the collision this all exists to
+            # prevent. Only the user can say which copy to keep.
+            print("           this source was converted before, so it keeps "
+                  "its number -\n           delete the earlier file before "
+                  "importing, or they collide")
     if opts.get("cover"):
         size = cover_size(opts["cover"])
         if not size:
@@ -1371,28 +1655,49 @@ def handle_local(path, prof, opts):
             print(f"  {CROSS} No video files in {path}")
             return False
         print(f"  {len(files)} video file(s) in this folder.")
-        if opts.get("tv_show"):
+        if opts.get("tv_show") and opts.get("explicit_episode") is not None:
             check_episode_range(opts["season"],
-                                opts["episode"] + len(files) - 1,
+                                opts["explicit_episode"] + len(files) - 1,
                                 f"  ({len(files)} files from --episode "
-                                f"{opts['episode']})")
+                                f"{opts['explicit_episode']})")
+        # A local folder has no metadata to detect a show from, so its own
+        # name is the only sensible guess for --series.
+        folder_name = os.path.basename(os.path.normpath(path))
         ok = 0
         for i, f in enumerate(files, 1):
             print(f"\n  [{i}/{len(files)}] {os.path.basename(f)}")
-            # Number from --episode upward. Position in the folder, not
-            # conversion success: a file that fails should leave its slot
-            # empty rather than shuffle every later episode down one.
-            item = item_opts(opts, episode=opts["episode"] + i - 1)
-            with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
-                if convert(f, opts["out"], os.path.splitext(
-                        os.path.basename(f))[0], prof, item, wd):
-                    ok += 1
+            # Wrapped per file, like handle_playlist: one unreadable file in a
+            # folder of forty must not end the run, and now that each item
+            # reserves an episode number there is state to keep consistent.
+            try:
+                item = plan_show(opts, offset=i - 1, fallback=folder_name,
+                                  src_path=f)
+                if item is None:
+                    continue
+                with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
+                    if convert(f, opts["out"], os.path.splitext(
+                            os.path.basename(f))[0], prof, item, wd):
+                        ok += 1
+            except KeyboardInterrupt:
+                print("\n  Skipped (Ctrl-C).")
+            except Exception as err:
+                print(f"  {CROSS} Skipped - {str(err)[:150]}")
         print(f"\n  {ok}/{len(files)} converted.")
         return ok > 0
 
+    if os.path.splitext(path)[1].lower() not in VIDEO_FILE_EXTS:
+        # Checked before the registry is touched: reserving an episode number
+        # for a PDF and then failing would leave a permanent gap in the show.
+        print(f"  {CROSS} Not a video file: {os.path.basename(path)}")
+        return False
+
     title = os.path.splitext(os.path.basename(path))[0]
+    item = plan_show(opts, fallback=os.path.basename(
+        os.path.dirname(os.path.abspath(path))), src_path=path)
+    if item is None:
+        return False
     with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
-        return bool(convert(path, opts["out"], title, prof, opts, wd))
+        return bool(convert(path, opts["out"], title, prof, item, wd))
 
 
 def handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra):
@@ -1401,10 +1706,11 @@ def handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra):
     folder = os.path.join(opts["out"], title)
     os.makedirs(folder, exist_ok=True)
     print(f"\n  Playlist: {title} - {len(entries)} item(s) -> {tilde(folder)}")
-    if opts.get("tv_show"):
-        check_episode_range(opts["season"], opts["episode"] + len(entries) - 1,
+    if opts.get("tv_show") and opts.get("explicit_episode") is not None:
+        check_episode_range(opts["season"],
+                            opts["explicit_episode"] + len(entries) - 1,
                             f"  ({len(entries)} items from --episode "
-                            f"{opts['episode']})")
+                            f"{opts['explicit_episode']})")
 
     failed, done = [], 0
     for i, entry in enumerate(entries, 1):
@@ -1421,7 +1727,12 @@ def handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra):
                 if not media:
                     failed.append((i, etitle, "download failed", eurl))
                     continue
-                item = item_opts(opts, minfo, opts["episode"] + i - 1)
+                # No `fallback` show name here: detect_show() already reads
+                # playlist_title, and a temp download path is not a show.
+                item = plan_show(opts, minfo, offset=i - 1, src_path=media)
+                if item is None:
+                    failed.append((i, etitle, "no episode number left", eurl))
+                    continue
                 if convert(media, folder, mtitle or etitle, prof, item, wd):
                     done += 1
                 else:
@@ -1458,7 +1769,11 @@ def handle_url(url, prof, opts, yt_dlp):
                                           cookie_extra)
         if not media:
             return False
-        item = item_opts(opts, minfo)
+        # Reached once per top-level input, so two URLs in one command line
+        # now get two numbers - they used to both come out as episode 1.
+        item = plan_show(opts, minfo, src_path=media)
+        if item is None:
+            return False
         return bool(convert(media, opts["out"], title, prof, item, wd))
 
 
@@ -1531,12 +1846,18 @@ def parse_args(argv):
     ap.add_argument("--tv-show", metavar="SERIES",
                     help="file this as a TV show episode of SERIES instead of a "
                          "home video. Changes which Finder pane it syncs from")
+    ap.add_argument("--series", action="store_true",
+                    help="like --tv-show but work out the show from the "
+                         "download itself (its series/channel/uploader, or the "
+                         "folder name for a local file). A show already in the "
+                         "registry continues; anything new starts at episode 1")
     ap.add_argument("--season", type=int, default=1, metavar="N",
                     help="season number for --tv-show (default: 1)")
-    ap.add_argument("--episode", type=int, default=1, metavar="N",
-                    help="episode number for --tv-show (default: 1) - this is "
-                         "what orders episodes within the season. On a folder "
-                         f"or playlist it is the START, counting up (max {TVES_MAX})")
+    ap.add_argument("--episode", type=int, default=None, metavar="N",
+                    help="episode number for --tv-show - what orders episodes "
+                         "within a season. On a folder or playlist it is the "
+                         f"START, counting up (max {TVES_MAX}). Omit it and the "
+                         "show registry hands out the next unused number")
     ap.add_argument("--description", metavar="TEXT",
                     help="short blurb -> the desc atom (trimmed to "
                          f"{DESC_BYTES} bytes)")
@@ -1566,6 +1887,12 @@ def parse_args(argv):
     ap.add_argument("--subs-lang", default="en", help="subtitle language (en)")
     ap.add_argument("--subs-auto", action="store_true",
                     help="accept auto-generated subtitles too")
+    ap.add_argument("--shows", action="store_true",
+                    help="list what the show registry remembers, then exit")
+    ap.add_argument("--rebuild-registry", metavar="SERIES",
+                    help="re-read the episode numbers already written into the "
+                         "files in --out and reset SERIES to match, then exit. "
+                         "The files are the truth; the registry is an index")
     ap.add_argument("--retag", metavar="FILE", action="append",
                     help="rewrite one existing file's tags losslessly (no "
                          "re-encode) using --tv-show/--season/--episode/"
@@ -1606,9 +1933,57 @@ def main(argv=None):
         print(f"\n  {msg}")
         return 0 if ok else 1
 
-    if args.tv_show:
+    # --episode defaults to None so "not given" is distinguishable from "1".
+    # Every path that does arithmetic on it needs a concrete int, so resolve
+    # one here, once, and keep the raw value for the registry to read.
+    explicit_episode = args.episode
+    episode_or_one = 1 if args.episode is None else args.episode
+
+    if args.shows:
+        reg = load_registry()
+        if not reg["shows"]:
+            print(f"\n  Nothing recorded yet - {tilde(REGISTRY_PATH)}")
+            return 0
+        print(f"\n  {tilde(REGISTRY_PATH)}")
+        for key in sorted(reg["shows"]):
+            entry = reg["shows"][key]
+            seasons = entry.get("seasons") or {}
+            spans = ", ".join(
+                f"S{int(sn):02d} next E{int(nx):02d}"
+                for sn, nx in sorted(seasons.items(), key=lambda kv: int(kv[0])))
+            print(f"    {entry.get('name') or key:<40} {spans or 'empty'}")
+        return 0
+
+    if args.rebuild_registry:
+        show = tidy_name(args.rebuild_registry)
+        out = os.path.expanduser(args.out)
+        found = registry_episodes_on_disk(out, show)
+        if not found:
+            print(f"\n  {CROSS} No files tagged as {show!r} in {tilde(out)} - "
+                  "nothing to rebuild from.")
+            return 1
+        reg = load_registry()
+        entry = reg["shows"].setdefault(show_key(show), {})
+        entry["name"] = show
+        seasons = entry.setdefault("seasons", {})
+        entry.setdefault("sources", {})
+        print(f"\n  {show}   from {tilde(out)}")
+        for season in sorted(found):
+            highest = max(found[season])
+            seasons[str(season)] = min(highest + 1, TVES_MAX + 1)
+            print(f"    S{season:02d}  {len(found[season])} episode(s) on "
+                  f"disk, highest E{highest:02d} -> next E{highest + 1:02d}")
+        save_registry(reg)
+        return 0
+
+    if args.tv_show is not None and not tidy_name(args.tv_show):
+        # " " is truthy, normalizes to an empty key, and would quietly become
+        # the show every other blank-named run also lands in.
+        raise SystemExit(f"  {CROSS} --tv-show cannot be blank.")
+    if args.tv_show and explicit_episode is not None:
         check_episode_range(args.season,
-                            args.episode + max(0, len(args.retag or []) - 1))
+                            episode_or_one
+                            + max(0, len(args.retag or []) - 1))
     cover = os.path.expanduser(args.cover) if args.cover else None
     if cover and not os.path.exists(cover):
         raise SystemExit(f"  {CROSS} No such cover image: {cover}")
@@ -1620,7 +1995,7 @@ def main(argv=None):
         opts = {
             "device": device, "out": os.path.expanduser(args.out),
             "ext": args.ext, "tv_show": args.tv_show, "season": args.season,
-            "episode": args.episode, "description": args.description,
+            "episode": episode_or_one, "description": args.description,
             "synopsis": args.synopsis, "date": args.date, "cover": cover,
             "subs_lang": args.subs_lang, "dry_run": args.dry_run,
             "verbose": args.verbose,
@@ -1633,7 +2008,7 @@ def main(argv=None):
                 continue
             # Number upward across several files, exactly like a folder run.
             if retag(one, profile_by_key(args.profile or DEFAULT_PROFILE),
-                     dict(opts, episode=args.episode + n)):
+                     dict(opts, episode=episode_or_one + n)):
                 done += 1
         print(f"\n  {done}/{len(args.retag)} re-tagged into "
               f"{tilde(opts['out'])}")
@@ -1656,7 +2031,9 @@ def main(argv=None):
         "out": os.path.expanduser(args.out),
         "ext": args.ext,
         "season": args.season,
-        "episode": args.episode,
+        "episode": episode_or_one,
+        "explicit_episode": explicit_episode,
+        "auto_series": args.series,
         "fast": args.fast,
         "force_encode": args.force_encode,
         "burn_subs": args.burn_subs,
@@ -1704,14 +2081,20 @@ def main(argv=None):
 
     print(f"\n{'=' * 60}")
     print(f"{ok}/{len(inputs)} item(s) ready in {tilde(opts['out'])}")
-    if opts["tv_show"]:
+    if opts["tv_show"] or opts["auto_series"]:
         # Tagging as a TV show moves the file to a DIFFERENT Finder pane. Saying
         # so here prevents the failure that otherwise reads as a broken sync:
         # the user looks under Movies, finds nothing, and assumes the encode
         # failed. The auto-include warning matters for the same reason - a
         # capped "N newest unwatched" rule drops episodes silently.
-        print(f"Sync: tagged as a TV show ({opts['tv_show']} "
-              f"S{opts['season']:02d}E{opts['episode']:02d}).")
+        if opts["tv_show"]:
+            print(f"Sync: tagged as a TV show ({opts['tv_show']}). Episode "
+                  "numbers are in each item's report above.")
+        else:
+            # With --series the show is resolved per item, so there is no one
+            # name to print here - convert() reported each as it went.
+            print("Sync: tagged as TV show episodes (see each item above; "
+                  "--shows lists what the registry now holds).")
         print("      Drag into the Apple TV app -> it lands under TV Shows, "
               "NOT Home Videos.")
         print("      Then Finder -> the device -> TV Shows (not Movies) -> tick "
