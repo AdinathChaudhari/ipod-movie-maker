@@ -37,6 +37,8 @@ only way that works — git history keeps whatever was pushed once.
   - `build_ffmpeg_cmd()` — one builder for all three plans.
   - `verify()` — ffprobes the finished file against the envelope; also the whole
     of `--check`.
+  - `run_ffmpeg()` — the only place ffmpeg is spawned for a conversion. Filters
+    `FFMPEG_NOISE` off stderr and returns `(rc, lines_hidden)`.
   - `fmt_spec()` — the yt-dlp format selector (the point of the whole tool).
   - `handle_url()` / `handle_playlist()` / `handle_local()` — the three drivers.
   - `tilde()` — display-only helper that collapses `$HOME` back to `~` in every
@@ -144,6 +146,22 @@ no persistent state.
   never verified against hardware. If it turns out not to work the only
   fallback is burn-in, which needs an ffmpeg built with `libass`. Bitmap subs
   (PGS/VobSub) cannot convert and are dropped with a warning.
+- **ffmpeg's decoder chatter is about the *source*, not the output, and it drowns
+  the report.** A single 2-hour pull emitted several hundred `[h264 @ 0x...] Late
+  SEI is not implemented` + `If you want to help, upload a sample` pairs while
+  remuxing perfectly — enough to push this tool's own console report off screen,
+  which is the report a user needs to see. `run_ffmpeg()` reads stderr itself and
+  drops the `FFMPEG_NOISE` substrings, then `convert()` prints a `quiet  N
+  decoder message(s) … hidden` tally. Two rules for that list: **match
+  substrings, never whole lines** (every message carries a `[h264 @ 0x...]`
+  thread address that changes each run), and **count, never silently swallow** —
+  `--verbose` restores the raw passthrough. Do NOT reach for `-loglevel error`
+  instead; that also hides muxer warnings that do describe the output.
+- **`run_ffmpeg()` splits stderr on `\r` *and* `\n`.** ffmpeg terminates its
+  `-stats` progress line with a carriage return, so a plain `for line in stderr`
+  never flushes the counter and a 15-minute encode looks frozen. Each progress
+  line is rewritten in place with a trailing `\033[K`, or a shrinking line
+  leaves the tail of the previous one on screen.
 - **Not every ffmpeg build is the same.** Some builds ship without `libass` (so
   no `subtitles` filter, so `--burn-subs` cannot work) or without `libzimg` (so
   no `zscale`, so HDR cannot be tone-mapped). `ffmpeg_has()` probes for both at

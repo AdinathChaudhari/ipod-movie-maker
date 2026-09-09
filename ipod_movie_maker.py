@@ -269,6 +269,83 @@ def ffmpeg_has(kind, name):
     return _CAPS[key]
 
 
+# libavcodec's decoders narrate quirks of the *source* bitstream on stderr, and a
+# single pull can emit hundreds of identical lines while remuxing perfectly. None
+# of it describes the file being written, and the volume buries what does matter:
+# real ffmpeg errors, and this tool's own report. Match on substrings rather than
+# whole lines - every one of these messages carries a per-thread "[h264 @ 0x...]"
+# prefix whose address differs on every run, so an exact-line filter never hits.
+FFMPEG_NOISE = (
+    "late sei is not implemented",
+    "update your ffmpeg version to the newest one from git",
+    "it means that your file has a feature which has not been implemented",
+    "if you want to help, upload a sample of this file",
+    "co located pocs unavailable",
+    "mmco: unref short failure",
+    "number of reference frames",
+    "non-existing pps",
+    "reinit context to",
+    "increasing reorder buffer",
+    "last message repeated",
+    "deprecated pixel format used",
+)
+
+CLEAR_EOL = "\033[K"
+
+
+def is_ffmpeg_noise(line):
+    low = line.lower()
+    return any(pat in low for pat in FFMPEG_NOISE)
+
+
+def run_ffmpeg(cmd, verbose=False):
+    """Run ffmpeg, echoing progress and real warnings but dropping the chatter.
+
+    Returns (returncode, lines_hidden). ffmpeg terminates its -stats progress
+    line with a carriage return, not a newline, so this splits on BOTH: reading
+    by line alone never flushes the counter and a long encode looks frozen.
+    Hidden lines are counted, never silently dropped - convert() prints the
+    tally, and --verbose bypasses this whole path for a raw passthrough.
+    """
+    if verbose:
+        return subprocess.call(cmd), 0
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True,
+                            errors="replace")
+    hidden = 0
+
+    def emit(line):
+        nonlocal hidden
+        line = line.strip()
+        if not line:
+            return
+        if is_ffmpeg_noise(line):
+            hidden += 1
+        elif line.startswith(("frame=", "size=", "video:")):
+            # Overwrite in place, and clear to end of line so a shrinking
+            # progress line leaves no tail of the previous one behind.
+            sys.stdout.write("\r  " + line + CLEAR_EOL)
+            sys.stdout.flush()
+        else:
+            sys.stdout.write("\r" + CLEAR_EOL + "  " + line + "\n")
+            sys.stdout.flush()
+
+    buf = ""
+    while True:
+        ch = proc.stderr.read(1)
+        if not ch:
+            break
+        if ch in "\r\n":
+            emit(buf)
+            buf = ""
+        else:
+            buf += ch
+    emit(buf)
+    proc.stderr.close()
+    return proc.wait(), hidden
+
+
 def probe_media(path):
     """ffprobe -> {'format': {...}, 'streams': [...]} or None if unreadable."""
     try:
@@ -827,7 +904,7 @@ def convert(src, out_dir, title, prof, opts, workdir):
         print("\n  " + " ".join(cmd))
         return None
     print()
-    rc = subprocess.call(cmd)
+    rc, hidden = run_ffmpeg(cmd, opts["verbose"])
     if rc != 0 or not os.path.exists(dst):
         # A copy/audio remux can fail on an exotic source (odd stream layout,
         # broken index). A full transcode almost never does - so fall back.
@@ -836,7 +913,8 @@ def convert(src, out_dir, title, prof, opts, workdir):
             plan["mode"] = "encode"
             plan["video_why"].append("remux failed on this source")
             cmd = build_ffmpeg_cmd(src, dst, plan, prof, opts)
-            rc = subprocess.call(cmd)
+            rc, again = run_ffmpeg(cmd, opts["verbose"])
+            hidden += again
         if rc != 0 or not os.path.exists(dst):
             print(f"  {CROSS} ffmpeg failed (exit {rc}).")
             if os.path.exists(dst):
@@ -844,6 +922,9 @@ def convert(src, out_dir, title, prof, opts, workdir):
             return None
 
     print(f"\n  {TICK} {tilde(dst)}   {human_size(os.path.getsize(dst))}")
+    if hidden:
+        print(f"  quiet    {hidden} decoder message(s) about the source hidden"
+              " (--verbose shows them)")
     print("  Checks:")
     if not verify(dst, opts["device"], prof):
         print(f"  {CROSS} This file does NOT meet the {opts['device']['label']} "
@@ -1197,6 +1278,9 @@ def parse_args(argv):
                          "then exit")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the ffmpeg command instead of running it")
+    ap.add_argument("--verbose", action="store_true",
+                    help="pass ffmpeg's output through unfiltered, including the "
+                         "decoder chatter normally hidden")
     return ap.parse_args(argv)
 
 
@@ -1251,6 +1335,7 @@ def main(argv=None):
         "subs_lang": args.subs_lang,
         "subs_auto": args.subs_auto,
         "dry_run": args.dry_run,
+        "verbose": args.verbose,
     }
 
     needs_net = any(is_url(i) for i in inputs)

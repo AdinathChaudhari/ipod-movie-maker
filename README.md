@@ -277,6 +277,20 @@ pip install -r requirements.txt      # yt-dlp
 | `--no-subs` / `--subs-lang` / `--subs-auto` | subtitle handling |
 | `--check FILE` | verify a file plays, then exit |
 | `--dry-run` | print the ffmpeg command instead of running it |
+| `--verbose` | show ffmpeg's raw output, including the decoder chatter normally hidden |
+
+**A note on the quiet console.** ffmpeg's H.264 decoder narrates quirks of the *source*
+bitstream on stderr — `Late SEI is not implemented`, `If you want to help, upload a
+sample`, and friends. A two-hour download can emit several hundred of those lines while
+remuxing perfectly, which buries the report that actually tells you whether the file will
+play. Those messages are filtered out and counted instead:
+
+```
+  quiet    412 decoder message(s) about the source hidden (--verbose shows them)
+```
+
+Nothing is swallowed silently — the count is always printed, real ffmpeg warnings and
+errors still come through, and `--verbose` gives you the raw stream back.
 
 **A note on ffmpeg builds.** Not every build carries every filter. Without `libass` there is
 no `subtitles` filter, so `--burn-subs` falls back to soft subtitles — fine, iOS takes those
