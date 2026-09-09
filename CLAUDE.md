@@ -39,6 +39,12 @@ only way that works — git history keeps whatever was pushed once.
     of `--check`.
   - `run_ffmpeg()` — the only place ffmpeg is spawned for a conversion. Filters
     `FFMPEG_NOISE` off stderr and returns `(rc, lines_hidden)`.
+  - `tv_show_metadata()` / `text_metadata()` / `cover_codec_args()` — the three
+    metadata blocks. All three are appended in the same pass as the encode.
+  - `item_opts()` — per-item copy of `opts`. **Every per-episode value goes
+    through here**; see the shared-`opts` gotcha below.
+  - `retag()` — `--retag`, a lossless `-c copy` tag rewrite. Verified
+    byte-identical: video and audio MD5 match the source exactly.
   - `fmt_spec()` — the yt-dlp format selector (the point of the whole tool).
   - `handle_url()` / `handle_playlist()` / `handle_local()` — the three drivers.
   - `tilde()` — display-only helper that collapses `$HOME` back to `~` in every
@@ -132,9 +138,67 @@ no persistent state.
   rules (e.g. *10 newest unwatched*) can silently drop episodes. `main()` prints
   that warning after any `--tv-show` run — looking under Movies and finding
   nothing reads exactly like a failed encode, so the reminder is load-bearing.
-  **Unverified:** whether iOS 9.3.5 accepts these atoms, and whether re-tagging a
-  file already imported reclassifies it. Only the device settles the first;
-  assume remove-and-re-add for the second.
+  **Verified on the device** (iPod touch 5, iOS 9.3.5): the show appears under
+  TV Programmes titled from `tvsh`, with a "Series 1" subtitle from `tvsn` and
+  an "Episode N - NNN mins" row from `tves`. These atoms are accepted, not
+  merely tolerated. **Still unverified:** whether re-tagging a file the TV app
+  has already imported reclassifies it in place — assume remove-and-re-add.
+- **`tvsn` and `tves` are ONE BYTE, whatever the atom looks like.** The atom
+  carries a 4-byte field, but ffmpeg's mov muxer clamps the *value* to a single
+  byte before writing it — measured on this build, not read from a doc:
+  `255` → 255, `256` → **0**, `300` → **44**, `20260909` → **45**. Silently,
+  exit 0. Two episodes that wrap to the same number collide exactly like two
+  literal duplicates. `check_episode_range()` refuses anything outside
+  `0..TVES_MAX` up front, and the folder/playlist drivers check
+  `start + count - 1` *before* converting anything rather than dying on item
+  200. This is why **date-as-episode-number does not work** — the obvious
+  scheme for dated podcast episodes is exactly the one that silently corrupts.
+- **`opts` is built once in `main()` and shared by every item in a batch.** Any
+  per-episode value — the number, the blurb, the date, the poster — must be
+  layered onto a copy via `item_opts()`, or item 1's values are written to all
+  forty files. This was a real bug: two episodes both went out as `S01E01`,
+  collapsed into one row on the device, and looked like a failed sync. The
+  number now counts up from `--episode` by **position in the folder, not by
+  conversion success**, so a file that fails leaves its slot empty instead of
+  shuffling every later episode down one.
+- **Every video arg is scoped to `:v:0`.** `-c:v:0`, `-profile:v:0`,
+  `-level:v:0`, `-b:v:0`, `-tag:v:0`, `-filter:v:0`, `-pix_fmt:v:0` — never the
+  bare form. The moment a poster is attached there are two video output
+  streams, and an unindexed `-c:v` / `-vf` matches the attached-pic stream too:
+  the result is a **zero-byte output file with exit code 0**. `-refs` is the
+  one exception, verified byte-identical either way (it is a private libx264
+  AVOption, not a stream-mapped one).
+- **The description keys are not the guessable ones.** `description` → `desc`
+  and `synopsis` → `ldes` are the only two spellings ffmpeg's mov muxer writes.
+  `longdesc`, `longdescription` and `summary` are all accepted without a
+  warning and write **no atom at all** — the output is byte-identical to
+  omitting them. ffmpeg enforces no length cap either (a 4000-byte `desc`
+  sails through), so `DESC_BYTES`/`LDES_BYTES` in `text_metadata()` are the
+  only limits that exist.
+- **The sort atoms cannot be written from here at all.** `sonm`/`sosn`/`soal`/
+  `soar` vanish under every spelling tried — the friendly names
+  (`sort_name`, `sort_show`, …) *and* the raw fourCCs passed directly. Same for
+  `purd`/`catg`/`pcst`. ffmpeg's mov muxer has no code path for them, and the
+  no-second-binary rule closes the alternative, so TV-show sort order is simply
+  unavailable. Don't re-derive this. (`-metadata encoder=` is a third trap: it
+  is not dropped but silently *overwritten* with ffmpeg's own `Lavf<version>`.)
+- **The poster is decoration; never let it cost the conversion.** `covr` comes
+  from a mapped attached-pic stream, added as the **last** `-i` so the sidecar
+  input indices keep their arithmetic. JPEG/PNG within `COVER_MAX_PX` are
+  copied byte-exact; a webp (what yt-dlp hands back) or anything oversized is
+  re-encoded to MJPEG in the same pass — scaling *forces* the transcode, since
+  you cannot filter a stream you are copying. Two failure paths both stay
+  non-fatal: `cover_size()` rejects a non-still image up front (an **animated**
+  webp has `ANIM`/`ANMF` chunks ffmpeg's decoder refuses — verified), and
+  `convert()` retries without the poster if the encoder chokes anyway. Dropping
+  it there also keeps it out of the remux-to-encode fallback, which rebuilds
+  the command from the same `opts`.
+- **`--retag` must map the poster across by hand.** `-map_metadata 0` copies
+  *tag* atoms, but `covr` is built from a stream, so a `-map` list of just
+  `0:v:0`/`0:a:0` **silently drops the artwork** — exit 0, no warning, and the
+  file still passes every check. `retag()` adds `-map 0:v:1?` when the source
+  has an attached pic and no new `--cover` replaces it. Losslessness is
+  verified, not assumed: video and audio MD5s match the source byte for byte.
 - **`-map_metadata -1`, then one clean `-metadata title=`.** Same lesson: don't
   copy arbitrary source tags into a file iOS 9.3.5 has to parse. A file the TV
   app imports but the iPod refuses looks like success on the Mac, which is the
@@ -193,3 +257,18 @@ exercise `encode`. A `libx264 -profile:v main -level 3.1` + `aac -ac 2 -ar 48000
 source exercises `copy`. Neither names anything, so both are safe to describe in
 public docs. `--check` on the output is the assertion; `head -c 12 out.m4v | xxd`
 is the muxer guard.
+
+For the metadata side, `ffprobe -show_entries format_tags` tells you what
+*survived*, which is the only question that matters given how many keys vanish
+without complaint. Prove a poster is really attached with
+`ffprobe -select_streams v:1 -show_entries stream_disposition=attached_pic` —
+`attached_pic=1` is the assertion, and a plain `grep covr` on the file is not:
+the 4-byte atom name straddles `xxd`'s 16-byte line boundary often enough to
+report a false negative. Prove a `--retag` was lossless by comparing
+`ffmpeg -i f -map 0:v:0 -c copy -f hash -hash md5 -` before and after.
+
+**Still only answerable on the device**, no amount of local probing settles
+these: whether `covr` fills the show tile and whether it is per-episode or
+per-show; which of `desc`/`ldes` the "Read More" affordance actually reads;
+the exact character count at which an episode title truncates; and whether the
+macOS TV app keys library entries by file tags or by an internal id.

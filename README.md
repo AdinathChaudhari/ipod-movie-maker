@@ -269,7 +269,12 @@ pip install -r requirements.txt      # yt-dlp
 | `-c, --codec` | `h264` (default) or `hevc` (`touch7` only — refused on `touch5`) |
 | `-o, --out` | output folder (default `~/Movies/iPod`) |
 | `--tv-show SERIES` | File it as a TV show episode instead of a home video — changes the sync pane |
-| `--season N` / `--episode N` | Season and episode numbers for `--tv-show` (both default to `1`) |
+| `--season N` / `--episode N` | Season and episode numbers for `--tv-show` (both default to `1`, max `255`). On a folder or playlist, `--episode` is the **start** and counts up |
+| `--description` / `--synopsis` | Short and long blurb — the `desc` and `ldes` atoms behind "Read More" |
+| `--date YYYY-MM-DD` | Release date — the `©day` atom |
+| `--cover IMAGE` | Poster image — the `covr` atom, which is what fills the grey show tile |
+| `--no-auto-meta` | Don't auto-fill blurb, date and poster from the download's own metadata |
+| `--retag FILE` | Rewrite one file's tags losslessly, no re-encode (repeatable) |
 | `--ext` | `m4v` (default) or `mp4` — the name only; the muxer stays mp4 either way |
 | `--fast` | macOS hardware encoder — around ten times faster |
 | `--force-encode` | transcode even when the source already fits |
@@ -278,6 +283,53 @@ pip install -r requirements.txt      # yt-dlp
 | `--check FILE` | verify a file plays, then exit |
 | `--dry-run` | print the ffmpeg command instead of running it |
 | `--verbose` | show ffmpeg's raw output, including the decoder chatter normally hidden |
+
+### Making a series out of loose episodes
+
+One run per show. Everything in the run lands under that one series, numbered
+upward from `--episode`:
+
+```
+$ python ipod_movie_maker.py --tv-show "Series A" ~/Videos/series-a/
+  3 video file(s) in this folder.
+
+  [1/3] sample-clip.mkv
+  plan     copy - remux only (lossless, no re-encode)
+  episode  Series A S01E01
+  poster   sample-clip.webp  1280x720 -> 600px
+  blurb    1204 characters into desc/ldes
+```
+
+Downloads fill the blurb, date and poster from the source's own metadata; a
+local folder needs `--description` / `--cover` if you want them. `--no-auto-meta`
+turns the auto-fill off.
+
+Two numbers matter more than they look. **Season and episode are the identity of
+an episode** — two files sharing `(show, season, episode)` do not become two
+rows, they become one, and the second silently replaces the first. And the
+ceiling is **255**: ffmpeg builds those atoms from a single byte, so `300`
+becomes `44` and a date like `20260909` becomes `45` with no warning at all.
+The tool refuses anything out of range up front, including a folder whose count
+would run past the end.
+
+### Fixing a file you already made
+
+`--retag` rewrites the tags with `-c copy` — the video and audio bitstreams come
+through byte-identical, so renumbering an hour-long episode takes seconds
+instead of an hour:
+
+```
+$ python ipod_movie_maker.py --retag ~/Movies/iPod/one.m4v \
+                             --retag ~/Movies/iPod/two.m4v \
+                             --tv-show "Series A" --episode 1
+  was      Series A S01E01
+  now      Series A S01E01
+  was      Series A S01E01
+  now      Series A S01E02
+```
+
+Existing artwork is carried across; pass `--cover` to replace it. Re-import into
+the Apple TV app afterwards rather than trusting it to notice the change.
 
 **A note on the quiet console.** ffmpeg's H.264 decoder narrates quirks of the *source*
 bitstream on stderr — `Late SEI is not implemented`, `If you want to help, upload a

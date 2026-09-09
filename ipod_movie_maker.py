@@ -166,6 +166,30 @@ SUB_FILE_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
 VIDEO_FILE_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
                    ".ts", ".mpg", ".mpeg", ".wmv", ".3gp", ".m2ts", ".ogv"}
 
+# Poster sources. .jpg/.jpeg/.png go into `covr` byte-for-byte with -c copy;
+# anything else is transcoded to MJPEG in the same pass. Deliberately disjoint
+# from VIDEO_FILE_EXTS - a thumbnail landing in the download workdir must never
+# be mistaken for the media file by download_to()'s glob.
+IMAGE_FILE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+COVER_COPY_EXTS = {".jpg", ".jpeg", ".png"}
+
+# Apple's own artwork is small and square, and the tile it fills is a few
+# hundred pixels wide. Anything larger is scaled down rather than embedded:
+# covr lives in moov, faststart puts moov before the media, and a 4K poster
+# would put a megabyte of JPEG in front of every play.
+COVER_MAX_PX = 600
+
+# ffmpeg's mov muxer builds the tvsn/tves atoms from a single byte, even though
+# the atom itself carries a 4-byte field: 256 -> 0, 300 -> 44, 20260909 -> 45,
+# silently, exit 0. Measured on this build, not read from a doc. Two episodes
+# that wrap to the same value collide exactly like two literal duplicates do.
+TVES_MAX = 255
+
+# `desc` is the short/preview field and `ldes` the long one. ffmpeg imposes no
+# cap on either (a 4000-byte desc sails straight through), so this is the only
+# place a limit exists.
+DESC_BYTES, LDES_BYTES = 240, 4000
+
 TICK, CROSS, WARN = "✓", "✗", "!"
 
 
@@ -173,6 +197,25 @@ TICK, CROSS, WARN = "✓", "✗", "!"
 def safe_filename(name):
     """Strip characters not allowed in file/folder names."""
     return re.sub(r'[\\/:*?"<>|]', "", name or "").strip() or "video"
+
+
+def clip_utf8(text, limit):
+    """Trim to `limit` bytes without splitting a multi-byte character."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return raw[:limit - 3].decode("utf-8", "ignore").rstrip() + "..."
+
+
+def check_episode_range(season, episode, note=""):
+    """Refuse a number ffmpeg would silently wrap. See TVES_MAX."""
+    for label, n in (("season", season), ("episode", episode)):
+        if not 0 <= n <= TVES_MAX:
+            raise SystemExit(
+                f"  {CROSS} {label} {n} is out of range (0-{TVES_MAX}).{note}\n"
+                f"      ffmpeg writes the tv{'sn' if label == 'season' else 'es'}"
+                f" atom from one byte, so {n} would silently become {n % 256} "
+                "and collide with a real episode.")
 
 
 def tilde(path):
@@ -663,18 +706,18 @@ def video_encoder_args(prof, opts):
                 "decode hardware, and its iOS predates HEVC software support "
                 "too). Drop --codec, or pass --device touch7.")
         if opts["fast"] and ffmpeg_has("encoder", "hevc_videotoolbox"):
-            return ["-c:v", "hevc_videotoolbox", "-b:v", prof["hevc_br"],
-                    "-tag:v", "hvc1"]
+            return ["-c:v:0", "hevc_videotoolbox", "-b:v:0", prof["hevc_br"],
+                    "-tag:v:0", "hvc1"]
         # hvc1 tag (not hev1) is what Apple's demuxer expects in an .mp4.
-        return ["-c:v", "libx265", "-preset", "medium",
-                "-crf", str(prof["hevc_crf"]), "-tag:v", "hvc1"]
+        return ["-c:v:0", "libx265", "-preset", "medium",
+                "-crf", str(prof["hevc_crf"]), "-tag:v:0", "hvc1"]
     if opts["fast"] and ffmpeg_has("encoder", "h264_videotoolbox"):
-        return ["-c:v", "h264_videotoolbox", "-b:v", prof["br"],
-                "-profile:v", device["encode_profile"],
-                "-level:v", device["encode_level"]]
-    args = ["-c:v", "libx264", "-preset", "slow", "-crf", str(prof["crf"]),
-            "-profile:v", device["encode_profile"],
-            "-level:v", device["encode_level"]]
+        return ["-c:v:0", "h264_videotoolbox", "-b:v:0", prof["br"],
+                "-profile:v:0", device["encode_profile"],
+                "-level:v:0", device["encode_level"]]
+    args = ["-c:v:0", "libx264", "-preset", "slow", "-crf", str(prof["crf"]),
+            "-profile:v:0", device["encode_profile"],
+            "-level:v:0", device["encode_level"]]
     if device["refs"]:
         args += ["-refs", str(device["refs"])]   # see DEVICES[...]["refs"]
     return args
@@ -720,17 +763,77 @@ def tv_show_metadata(opts):
     show = opts.get("tv_show")
     if not show:
         return []                       # absent flag = today's behaviour exactly
+    check_episode_range(opts["season"], opts["episode"])
     return ["-metadata", "media_type=10",
             "-metadata", "show=" + show,
             "-metadata", "season_number=%d" % opts["season"],
             "-metadata", "episode_sort=%d" % opts["episode"]]
 
 
+def text_metadata(opts):
+    """desc / ldes / (c)day - the atoms behind the episode blurb and its date.
+
+    The ffmpeg key names are not the obvious ones and guessing costs you
+    nothing but silence: `description` -> desc and `synopsis` -> ldes are the
+    only two spellings that write anything. `longdesc`, `longdescription` and
+    `summary` are all accepted without complaint and write no atom at all."""
+    args = []
+    desc = (opts.get("description") or "").strip()
+    synopsis = (opts.get("synopsis") or "").strip() or desc
+    if desc:
+        args += ["-metadata", "description=" + clip_utf8(desc, DESC_BYTES)]
+    if synopsis:
+        args += ["-metadata", "synopsis=" + clip_utf8(synopsis, LDES_BYTES)]
+    if opts.get("date"):
+        args += ["-metadata", "date=" + opts["date"]]
+    return args
+
+
+def cover_size(cover):
+    """(width, height) of a poster image, or None if it is not a usable one."""
+    for stream in (probe_media(cover) or {}).get("streams", []):
+        if stream.get("codec_type") == "video" and stream.get("width"):
+            return stream["width"], stream["height"]
+    return None
+
+
+def cover_codec_args(cover):
+    """Encoder args for the attached-pic stream, which is always v:1.
+
+    Copy is byte-exact and free, so it wins whenever the source is already a
+    JPEG or PNG of a sane size. Everything else - a webp thumbnail, which is
+    what yt-dlp hands back, or an oversized poster - is re-encoded to MJPEG in
+    this same pass. Note that scaling forces the transcode: you cannot filter
+    a stream you are copying."""
+    size = cover_size(cover)
+    ext = os.path.splitext(cover)[1].lower()
+    oversized = bool(size) and max(size) > COVER_MAX_PX
+    if ext in COVER_COPY_EXTS and not oversized:
+        args = ["-c:v:1", "copy"]
+    else:
+        # MJPEG wants a full-range pixel format; name it rather than let the
+        # negotiation pick one and warn about it.
+        args = ["-c:v:1", "mjpeg", "-pix_fmt:v:1", "yuvj420p"]
+        if oversized:
+            args += ["-filter:v:1",
+                     f"scale={COVER_MAX_PX}:{COVER_MAX_PX}"
+                     ":force_original_aspect_ratio=decrease"
+                     ":force_divisible_by=2"]
+    return args + ["-disposition:v:1", "attached_pic"]
+
+
 def build_ffmpeg_cmd(src, dst, plan, prof, opts):
+    cover = opts.get("cover")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
            "-i", src]
     for sub in plan["sidecars"]:
         cmd += ["-i", sub]
+    # The poster is the LAST input, after any sidecars, so the sidecar input
+    # indices below (1..len(sidecars)) keep their arithmetic. Its *output*
+    # stream is v:1 wherever its -map lands, because ':v:N' counts video
+    # streams rather than position.
+    if cover:
+        cmd += ["-i", cover]
 
     cmd += ["-map", "0:v:0"]
     if plan["a"]:
@@ -739,15 +842,24 @@ def build_ffmpeg_cmd(src, dst, plan, prof, opts):
         cmd += ["-map", f"0:s:{i}?"]
     for n, _ in enumerate(plan["sidecars"], start=1):
         cmd += ["-map", f"{n}:s:0?"]
+    if cover:
+        cmd += ["-map", f"{1 + len(plan['sidecars'])}:v:0"]
 
+    # Every video arg here is scoped to :v:0 whether or not a cover is present.
+    # Unindexed '-c:v' / '-profile:v' / '-vf' also match the attached-pic
+    # stream the moment one is, and the result is a zero-byte output file with
+    # exit code 0 - the failure mode this codebase least wants.
     if plan["mode"] == "copy":
-        cmd += ["-c:v", "copy", "-c:a", "copy"]
+        cmd += ["-c:v:0", "copy", "-c:a", "copy"]
     elif plan["mode"] == "audio":
-        cmd += ["-c:v", "copy"] + audio_encoder_args(plan, opts)
+        cmd += ["-c:v:0", "copy"] + audio_encoder_args(plan, opts)
     else:
         vf = video_filter_chain(plan, prof, opts)
-        cmd += video_encoder_args(prof, opts) + ["-vf", vf, "-pix_fmt", "yuv420p"]
+        cmd += video_encoder_args(prof, opts)
+        cmd += ["-filter:v:0", vf, "-pix_fmt:v:0", "yuv420p"]
         cmd += audio_encoder_args(plan, opts) if plan["a"] else []
+    if cover:
+        cmd += cover_codec_args(cover)
 
     if plan["embedded_text_subs"] or plan["sidecars"]:
         cmd += ["-c:s", "mov_text"]
@@ -764,6 +876,7 @@ def build_ffmpeg_cmd(src, dst, plan, prof, opts):
         # subtitle menu, which on this device is the only player there is.
         cmd += ["-metadata:s:s:0", "language=" + iso639_2(opts["subs_lang"])]
     cmd += tv_show_metadata(opts)
+    cmd += text_metadata(opts)
     # Force the mp4 muxer even when the output is named .m4v. ffmpeg maps that
     # extension to its `ipod` muxer, which is precisely the muxer ipod-drop
     # found writes tags iOS 9.3.5 rejects. The .m4v name exists only to keep
@@ -860,6 +973,34 @@ MODE_BLURB = {
 }
 
 
+def item_opts(opts, info=None, episode=None):
+    """A per-item copy of opts, auto-filled from yt-dlp's info dict.
+
+    main() builds `opts` once and every item in a batch shares that one object,
+    so anything genuinely per-episode - the number, the blurb, the date, the
+    poster - has to be layered onto a copy. Threading only the episode number
+    through (and leaving the rest shared) is what makes item 1's description
+    show up on all forty episodes."""
+    out = dict(opts)
+    if episode is not None:
+        out["episode"] = episode
+    if not info or opts.get("no_auto_meta"):
+        return out
+    # An explicit flag always wins; auto-fill only ever fills a blank.
+    blurb = (info.get("description") or "").strip()
+    if blurb:
+        if not out.get("description"):
+            out["description"] = blurb
+        if not out.get("synopsis"):
+            out["synopsis"] = blurb
+    day = info.get("upload_date") or ""
+    if not out.get("date") and len(day) == 8 and day.isdigit():
+        out["date"] = f"{day[:4]}-{day[4:6]}-{day[6:]}"
+    if not out.get("cover") and info.get("_thumbnail_path"):
+        out["cover"] = info["_thumbnail_path"]
+    return out
+
+
 def convert(src, out_dir, title, prof, opts, workdir):
     """Fit one media file for the iPod. Returns the output path, or None."""
     plan = build_plan(src, prof, opts, workdir)
@@ -898,6 +1039,25 @@ def convert(src, out_dir, title, prof, opts, workdir):
     if plan["embedded_text_subs"] or plan["sidecars"]:
         print(f"  subs     {len(plan['embedded_text_subs']) + len(plan['sidecars'])}"
               " track(s) as mov_text (tagged for the Videos app)")
+    if opts.get("tv_show"):
+        print(f"  episode  {opts['tv_show']} "
+              f"S{opts['season']:02d}E{opts['episode']:02d}")
+    if opts.get("cover"):
+        size = cover_size(opts["cover"])
+        if not size:
+            # An animated webp, a truncated download, a file that is not
+            # really an image. Say so once and carry on without it.
+            print(f"  {WARN} Poster {os.path.basename(opts['cover'])} is not a "
+                  "readable still image - continuing without it.")
+            opts = dict(opts, cover=None)
+        else:
+            scaled = "" if max(size) <= COVER_MAX_PX else \
+                f" -> {COVER_MAX_PX}px"
+            print(f"  poster   {os.path.basename(opts['cover'])}  "
+                  f"{size[0]}x{size[1]}{scaled}")
+    if (opts.get("description") or opts.get("synopsis")):
+        print(f"  blurb    {len((opts.get('synopsis') or opts['description']))}"
+              " characters into desc/ldes")
 
     cmd = build_ffmpeg_cmd(src, dst, plan, prof, opts)
     if opts["dry_run"]:
@@ -905,6 +1065,16 @@ def convert(src, out_dir, title, prof, opts, workdir):
         return None
     print()
     rc, hidden = run_ffmpeg(cmd, opts["verbose"])
+    if (rc != 0 or not os.path.exists(dst)) and opts.get("cover"):
+        # The poster is decoration; the video is the point. An image ffprobe
+        # accepted but the encoder then choked on must not cost the whole
+        # conversion - and dropping it here also keeps it out of the encode
+        # fallback below, which rebuilds the command from this same `opts`.
+        print(f"  {WARN} Poster could not be embedded; retrying without it.")
+        opts = dict(opts, cover=None)
+        cmd = build_ffmpeg_cmd(src, dst, plan, prof, opts)
+        rc, again = run_ffmpeg(cmd, opts["verbose"])
+        hidden += again
     if rc != 0 or not os.path.exists(dst):
         # A copy/audio remux can fail on an exotic source (odd stream layout,
         # broken index). A full transcode almost never does - so fall back.
@@ -929,6 +1099,86 @@ def convert(src, out_dir, title, prof, opts, workdir):
     if not verify(dst, opts["device"], prof):
         print(f"  {CROSS} This file does NOT meet the {opts['device']['label']} "
               "envelope - re-run with --force-encode.")
+    return dst
+
+
+def retag(path, prof, opts):
+    """Rewrite the iTunes tags on an existing file without re-encoding it.
+
+    The fix for the one mistake this tool makes easy to make: two episodes that
+    ended up with the same number. `-c copy` means the video and audio
+    bitstreams are the exact bytes that already passed verify(), so renumbering
+    costs a moov rebuild and nothing else - seconds, not an hour."""
+    info = probe_media(path)
+    if not info:
+        print(f"  {CROSS} ffprobe cannot read {tilde(path)}")
+        return None
+    cover = opts.get("cover")
+    has_poster = any((st.get("disposition") or {}).get("attached_pic")
+                     for st in info.get("streams", []))
+
+    os.makedirs(opts["out"], exist_ok=True)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    dst = unique_path(os.path.join(opts["out"],
+                                   safe_filename(stem) + "." + opts["ext"]))
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y",
+           "-i", path]
+    if cover:
+        cmd += ["-i", cover]
+    cmd += ["-map", "0:v:0"]
+    if streams_of(info, "audio"):
+        cmd += ["-map", "0:a:0"]
+    for n, _ in enumerate(streams_of(info, "subtitle")):
+        cmd += ["-map", f"0:s:{n}?"]
+    # Carry an existing poster across by hand. -map_metadata copies tag atoms,
+    # but covr is built from a mapped attached-pic *stream* - a -map list that
+    # forgets it drops the artwork silently, exit code 0, no warning.
+    if cover:
+        cmd += ["-map", "1:v:0"]
+    elif has_poster:
+        cmd += ["-map", "0:v:1?"]
+    cmd += ["-c", "copy"]
+    if cover:
+        cmd += cover_codec_args(cover)
+    # Keep what is already there, then override the fields being changed.
+    cmd += ["-map_metadata", "0"]
+    cmd += tv_show_metadata(opts) + text_metadata(opts)
+    cmd += ["-f", "mp4", "-max_muxing_queue_size", "1024",
+            "-movflags", "+faststart", dst]
+
+    was = (info.get("format") or {}).get("tags") or {}
+    print(f"\n  {os.path.basename(path)}")
+    print(f"  was      {was.get('show') or 'no show'} "
+          f"S{int(was.get('season_number') or 0):02d}"
+          f"E{int(was.get('episode_sort') or 0):02d}")
+    if opts.get("tv_show"):
+        print(f"  now      {opts['tv_show']} "
+              f"S{opts['season']:02d}E{opts['episode']:02d}")
+    if cover:
+        print(f"  poster   {os.path.basename(cover)}")
+    elif has_poster:
+        print("  poster   carried across from the source")
+    if opts["dry_run"]:
+        print("\n  " + " ".join(cmd))
+        return None
+
+    print()
+    rc, hidden = run_ffmpeg(cmd, opts["verbose"])
+    if rc != 0 or not os.path.exists(dst):
+        print(f"  {CROSS} Re-tag failed (exit {rc}).")
+        if os.path.exists(dst):
+            os.remove(dst)
+        return None
+    print(f"\n  {TICK} {tilde(dst)}   {human_size(os.path.getsize(dst))}")
+    if hidden:
+        print(f"  quiet    {hidden} decoder message(s) about the source hidden"
+              " (--verbose shows them)")
+    print("  Checks:")
+    if not verify(dst, opts["device"], prof):
+        print(f"  {CROSS} The re-tagged file no longer meets the "
+              f"{opts['device']['label']} envelope - keep the original.")
+        return None
     return dst
 
 
@@ -1044,6 +1294,11 @@ def download_to(url, workdir, prof, opts, yt_dlp, cookie_extra=None):
         "no_warnings": False,
         "merge_output_format": "mkv",   # lossless container; we remux after
     })
+    if opts.get("auto_cover") and not opts.get("cover"):
+        # Plain file, no thumbnail-convert postprocessor: keeping it raw means
+        # the pipeline stays at two processes (yt-dlp, then one ffmpeg), and
+        # our own ffmpeg pass does any conversion the covr atom needs.
+        ydl_opts["writethumbnail"] = True
     if not opts["no_subs"]:
         ydl_opts.update({
             "writesubtitles": True,
@@ -1065,14 +1320,20 @@ def download_to(url, workdir, prof, opts, yt_dlp, cookie_extra=None):
         return None, None
     info = got[0] or {}
 
-    media = [p for p in glob.glob(os.path.join(workdir, "*"))
+    everything = glob.glob(os.path.join(workdir, "*"))
+    media = [p for p in everything
              if os.path.splitext(p)[1].lower() in VIDEO_FILE_EXTS]
     if not media:
         print(f"  {CROSS} Nothing downloadable found at that URL.")
-        return None, None
+        return None, None, {}
     media.sort(key=os.path.getsize, reverse=True)
+    posters = sorted((p for p in everything
+                      if os.path.splitext(p)[1].lower() in IMAGE_FILE_EXTS),
+                     key=os.path.getsize, reverse=True)
+    if posters:
+        info["_thumbnail_path"] = posters[0]
     return media[0], (info.get("title") or os.path.splitext(
-        os.path.basename(media[0]))[0])
+        os.path.basename(media[0]))[0]), info
 
 
 # ── Failure manifest (house convention: one dead item never aborts a batch) ───
@@ -1110,12 +1371,21 @@ def handle_local(path, prof, opts):
             print(f"  {CROSS} No video files in {path}")
             return False
         print(f"  {len(files)} video file(s) in this folder.")
+        if opts.get("tv_show"):
+            check_episode_range(opts["season"],
+                                opts["episode"] + len(files) - 1,
+                                f"  ({len(files)} files from --episode "
+                                f"{opts['episode']})")
         ok = 0
         for i, f in enumerate(files, 1):
             print(f"\n  [{i}/{len(files)}] {os.path.basename(f)}")
+            # Number from --episode upward. Position in the folder, not
+            # conversion success: a file that fails should leave its slot
+            # empty rather than shuffle every later episode down one.
+            item = item_opts(opts, episode=opts["episode"] + i - 1)
             with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
                 if convert(f, opts["out"], os.path.splitext(
-                        os.path.basename(f))[0], prof, opts, wd):
+                        os.path.basename(f))[0], prof, item, wd):
                     ok += 1
         print(f"\n  {ok}/{len(files)} converted.")
         return ok > 0
@@ -1131,6 +1401,10 @@ def handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra):
     folder = os.path.join(opts["out"], title)
     os.makedirs(folder, exist_ok=True)
     print(f"\n  Playlist: {title} - {len(entries)} item(s) -> {tilde(folder)}")
+    if opts.get("tv_show"):
+        check_episode_range(opts["season"], opts["episode"] + len(entries) - 1,
+                            f"  ({len(entries)} items from --episode "
+                            f"{opts['episode']})")
 
     failed, done = [], 0
     for i, entry in enumerate(entries, 1):
@@ -1142,12 +1416,13 @@ def handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra):
             continue
         try:
             with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
-                media, mtitle = download_to(eurl, wd, prof, opts, yt_dlp,
-                                            cookie_extra)
+                media, mtitle, minfo = download_to(eurl, wd, prof, opts,
+                                                   yt_dlp, cookie_extra)
                 if not media:
                     failed.append((i, etitle, "download failed", eurl))
                     continue
-                if convert(media, folder, mtitle or etitle, prof, opts, wd):
+                item = item_opts(opts, minfo, opts["episode"] + i - 1)
+                if convert(media, folder, mtitle or etitle, prof, item, wd):
                     done += 1
                 else:
                     failed.append((i, etitle, "convert failed", eurl))
@@ -1179,10 +1454,12 @@ def handle_url(url, prof, opts, yt_dlp):
         return handle_playlist(url, info, prof, opts, yt_dlp, cookie_extra)
 
     with tempfile.TemporaryDirectory(prefix="ipodmoviemaker-") as wd:
-        media, title = download_to(url, wd, prof, opts, yt_dlp, cookie_extra)
+        media, title, minfo = download_to(url, wd, prof, opts, yt_dlp,
+                                          cookie_extra)
         if not media:
             return False
-        return bool(convert(media, opts["out"], title, prof, opts, wd))
+        item = item_opts(opts, minfo)
+        return bool(convert(media, opts["out"], title, prof, item, wd))
 
 
 # ── Interactive prompts ───────────────────────────────────────────────────────
@@ -1258,7 +1535,23 @@ def parse_args(argv):
                     help="season number for --tv-show (default: 1)")
     ap.add_argument("--episode", type=int, default=1, metavar="N",
                     help="episode number for --tv-show (default: 1) - this is "
-                         "what orders episodes within the season")
+                         "what orders episodes within the season. On a folder "
+                         f"or playlist it is the START, counting up (max {TVES_MAX})")
+    ap.add_argument("--description", metavar="TEXT",
+                    help="short blurb -> the desc atom (trimmed to "
+                         f"{DESC_BYTES} bytes)")
+    ap.add_argument("--synopsis", metavar="TEXT",
+                    help="long blurb -> the ldes atom; defaults to "
+                         "--description when only that is given")
+    ap.add_argument("--date", metavar="YYYY-MM-DD",
+                    help="release date -> the (c)day atom")
+    ap.add_argument("--cover", metavar="IMAGE",
+                    help="poster image (jpg/png embedded as-is, anything else "
+                         "converted) -> the covr atom, which is what fills the "
+                         "grey show tile")
+    ap.add_argument("--no-auto-meta", action="store_true",
+                    help="do not auto-fill blurb, date and poster from the "
+                         "download's own metadata")
     ap.add_argument("--ext", choices=["m4v", "mp4"], default="m4v",
                     help="output container extension (default: m4v, which the "
                          "Apple TV app imports most reliably)")
@@ -1273,6 +1566,10 @@ def parse_args(argv):
     ap.add_argument("--subs-lang", default="en", help="subtitle language (en)")
     ap.add_argument("--subs-auto", action="store_true",
                     help="accept auto-generated subtitles too")
+    ap.add_argument("--retag", metavar="FILE", action="append",
+                    help="rewrite one existing file's tags losslessly (no "
+                         "re-encode) using --tv-show/--season/--episode/"
+                         "--cover/--description; repeatable")
     ap.add_argument("--check", metavar="FILE",
                     help="report whether FILE plays on the selected --device, "
                          "then exit")
@@ -1309,6 +1606,39 @@ def main(argv=None):
         print(f"\n  {msg}")
         return 0 if ok else 1
 
+    if args.tv_show:
+        check_episode_range(args.season,
+                            args.episode + max(0, len(args.retag or []) - 1))
+    cover = os.path.expanduser(args.cover) if args.cover else None
+    if cover and not os.path.exists(cover):
+        raise SystemExit(f"  {CROSS} No such cover image: {cover}")
+    if cover and os.path.splitext(cover)[1].lower() not in IMAGE_FILE_EXTS:
+        raise SystemExit(f"  {CROSS} --cover must be one of "
+                         f"{', '.join(sorted(IMAGE_FILE_EXTS))}: {cover}")
+
+    if args.retag:
+        opts = {
+            "device": device, "out": os.path.expanduser(args.out),
+            "ext": args.ext, "tv_show": args.tv_show, "season": args.season,
+            "episode": args.episode, "description": args.description,
+            "synopsis": args.synopsis, "date": args.date, "cover": cover,
+            "subs_lang": args.subs_lang, "dry_run": args.dry_run,
+            "verbose": args.verbose,
+        }
+        done = 0
+        for n, one in enumerate(args.retag):
+            one = os.path.expanduser(one)
+            if not os.path.exists(one):
+                print(f"  {CROSS} No such file: {tilde(one)}")
+                continue
+            # Number upward across several files, exactly like a folder run.
+            if retag(one, profile_by_key(args.profile or DEFAULT_PROFILE),
+                     dict(opts, episode=args.episode + n)):
+                done += 1
+        print(f"\n  {done}/{len(args.retag)} re-tagged into "
+              f"{tilde(opts['out'])}")
+        return 0 if done else 1
+
     inputs = [os.path.expanduser(i) for i in args.inputs] or collect_inputs(device)
     prof = profile_by_key(args.profile) if args.profile else (
         profile_by_key(DEFAULT_PROFILE) if args.inputs else ask_profile(device))
@@ -1325,7 +1655,6 @@ def main(argv=None):
         "device": device,
         "out": os.path.expanduser(args.out),
         "ext": args.ext,
-        "tv_show": args.tv_show,
         "season": args.season,
         "episode": args.episode,
         "fast": args.fast,
@@ -1336,6 +1665,13 @@ def main(argv=None):
         "subs_auto": args.subs_auto,
         "dry_run": args.dry_run,
         "verbose": args.verbose,
+        "tv_show": args.tv_show,
+        "description": args.description,
+        "synopsis": args.synopsis,
+        "date": args.date,
+        "cover": cover,
+        "no_auto_meta": args.no_auto_meta,
+        "auto_cover": not args.no_auto_meta,
     }
 
     needs_net = any(is_url(i) for i in inputs)
