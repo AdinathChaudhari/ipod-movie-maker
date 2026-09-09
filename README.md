@@ -1,7 +1,7 @@
 <!--
 GitHub metadata — authored here, applied by hand in repo Settings (NOT rendered on the page):
-About:  Download, remux, transcode & verify video for an iPod touch (5th gen) — a single-file yt-dlp + FFmpeg CLI that picks the cheapest of three plans and ffprobes what it wrote.
-Topics (ranked): video-converter, ffmpeg, yt-dlp, ipod, h264, video-transcoding, ipod-touch, ios, python, cli, macos, ffprobe, hardware-decoding, media-conversion, apple-a5, subtitles, m4v
+About:  Download, convert & organise video for an iPod touch (5th gen) — a single-file yt-dlp + FFmpeg CLI that picks the cheapest of three plans, numbers each podcast as a TV show, and ffprobes what it wrote.
+Topics (ranked): video-converter, ffmpeg, yt-dlp, ipod, h264, video-transcoding, ipod-touch, ios, python, cli, macos, ffprobe, hardware-decoding, metadata, podcast, apple-a5, subtitles, m4v
 Social preview: docs/media/hero-glass.jpg (1280x640) — derived from docs/media/hero.png by
         `python Tools/image_compress.py docs/media/hero.png 1MB --glass`, uploaded by hand
         in Settings > General > Social preview. The card is git-ignored; hero.png is the source.
@@ -10,7 +10,7 @@ Social preview: docs/media/hero-glass.jpg (1280x640) — derived from docs/media
 # ipod-movie-maker — Video for an iPod touch
 
 **Paste a link. It plays on the iPod.**  
-*A single-file CLI that pulls the smallest stream that fits, picks the cheapest of three conversion plans, and ffprobes the result against the device's real decoder limits before calling it done.*
+*A single-file CLI that pulls the smallest stream that fits, picks the cheapest of three conversion plans, files a podcast as a numbered TV show, and ffprobes the result against the device's real decoder limits before calling it done.*
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -35,7 +35,9 @@ Fusion) is one more entry in that table, reachable with `--device touch7`.
 | **An H.264 file with AC3, DTS or Opus sound** | [`audio`](ipod_movie_maker.py) | Picture stream copied untouched, sound re-encoded to 48 kHz stereo AAC |
 | **A 4K, HEVC, 10-bit or 60 fps file** | [`encode`](ipod_movie_maker.py) | Full transcode into the panel's envelope: H.264 Main level 3.1, 8-bit, 30 fps, ≤ 720p |
 | **A folder or a playlist link** | [one per item](ipod_movie_maker.py) | Each item planned on its own; a dead item lands in `failed.txt` and the batch keeps going |
+| **A podcast episode, week after week** | [`--series`](ipod_movie_maker.py) | Resolves the show from the download itself and hands it the next unused episode number — a show it has seen continues, one it hasn't starts at E01 |
 | **A file you already have** | [`--check`](ipod_movie_maker.py) | ffprobes it against the device envelope and exits non-zero if it will not play |
+| **A file numbered wrong** | [`--retag`](ipod_movie_maker.py) | Rewrites the tags with `-c copy` — byte-identical streams, seconds instead of an hour |
 
 ## Quick start
 
@@ -232,9 +234,21 @@ python ipod_movie_maker.py ep03.mkv --tv-show "Series Name" --season 1 --episode
 | `tvsh` | `--tv-show` | Series name; episodes group by exact string match |
 | `tvsn` | `--season` | Groups episodes into a season |
 | `tves` | `--episode` | Orders episodes *within* the season |
+| `covr` | `--cover` | The poster. Without it the show tile is a grey placeholder glyph |
+| `desc` | `--description` | The short blurb on the episode row |
+| `ldes` | `--synopsis` | The long blurb behind the player's "Read More" |
+| `©day` | `--date` | Release date |
 
-Season and episode are not cosmetic. Without them the file still lands under TV Shows but
-sorts by filename, which discards the only reason to tag it.
+**Verified on the device**, not assumed: on an iPod touch 5 running iOS 9.3.5 the show
+appears under *TV Programmes* titled from `tvsh`, subtitled "Series 1" from `tvsn`, with an
+"Episode N — NNN mins" row from `tves`. These atoms are accepted, not merely tolerated.
+
+Season and episode are not cosmetic, and they are not just for sorting — **they are the
+identity of an episode.** Two files sharing `(show, season, episode)` do not become two
+rows; the second silently replaces the first. That is why the numbers are remembered
+between runs: see [Remembering where a show got to](#remembering-where-a-show-got-to).
+Both are capped at **255** — ffmpeg builds those atoms from a single byte, so `300` becomes
+`44` with no warning at all.
 
 **It changes which pane you sync from.** A TV-show-tagged file leaves the Movies list
 entirely: import puts it under *TV Shows*, and Finder syncs it from its own **TV Shows**

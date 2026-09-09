@@ -26,10 +26,27 @@ the target height, preferring H.264 where the site offers it - so a 4K source
 is never dragged down the wire just to be thrown away, and path 1 hits far
 more often than you would expect.
 
+Getting it onto the device is half the problem, so the tagging is not an
+afterthought. Written in the same ffmpeg pass as the encode:
+
+  stik/tvsh/tvsn/tves  - files an episode as a TV show rather than a home
+                         video, which is a different Finder sync pane
+  covr                 - the poster art, or the show tile stays a grey glyph
+  desc/ldes            - the blurb behind the player's "Read More"
+
+Those numbers have to survive between runs, because Apple keys an episode by
+(show, season, episode) and silently REPLACES a duplicate triple - so episode
+two, converted next week, would overwrite episode one rather than appear
+beside it. A small registry remembers where each show got to; --series
+resolves the show from the download and takes the next number, and something
+it has never seen starts a new show at episode 1.
+
 Usage:
     python ipod_movie_maker.py                        # interactive
     python ipod_movie_maker.py <url|file> [...]       # straight to work
+    python ipod_movie_maker.py --series <url>         # file it as the next episode
     python ipod_movie_maker.py --check movie.mp4      # will this play? (no encode)
+    python ipod_movie_maker.py --shows                # what the registry holds
 
 Every constant below is derived from a real device's decoder limits and the
 1136x640 panel, not from taste. See PROFILES and DEVICES.
