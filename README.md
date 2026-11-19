@@ -18,7 +18,7 @@ Social preview: docs/media/hero-glass.jpg (1280x640) — derived from docs/media
 ![Requires: FFmpeg](https://img.shields.io/badge/requires-FFmpeg-007808)
 
 <p align="center">
-  <img src="docs/media/hero.png" alt="ipod-movie-maker — a film ribbon narrowing into a small glowing pocket screen" width="820">
+  <img src="docs/media/hero-rounded.png" alt="ipod-movie-maker — a film ribbon narrowing into a small glowing pocket screen" width="820">
 </p>
 
 A converter that aims at exactly one thing: a 1136 × 640 panel driven by an Apple A5,
